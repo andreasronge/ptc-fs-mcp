@@ -192,11 +192,6 @@ The suite drives the built `dist/cli.js` as a real child process over real
 stdio, so what ships is what is tested. Roots are generated per test rather
 than committed, because this server writes as well as reads.
 
-## Design
-
-[`docs/plan.md`](docs/plan.md) is the design document: why one server rather
-than two, why live bytes rather than a frozen snapshot, and what that costs.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
