@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual runs are always a rehearsal. There is deliberately no input to turn
+  # that off, so the only way to publish for real is to push a tag.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,6 +27,7 @@ jobs:
       - run: npm ci
 
       - name: Tag must match the manifest version
+        if: github.event_name == 'push'
         run: |
           tagged="${GITHUB_REF_NAME#v}"
           declared="$(node -p 'require("./package.json").version')"
@@ -32,7 +36,42 @@ jobs:
             exit 1
           }
 
-      # prepublishOnly reruns format, typecheck, and the full suite.
-      - run: npm publish --access public --provenance
+      - name: The secret authenticates against the registry
+        run: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # npm derives a provenance attestation from an OIDC token, and refuses
+      # when the manifest's repository does not match the repository the
+      # workflow runs in. Both are checked here so a rehearsal fails on a
+      # misconfiguration rather than the real publish doing so.
+      - name: Provenance prerequisites are in place
+        run: |
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_URL" || {
+            echo "no OIDC token available; id-token: write is missing" >&2
+            exit 1
+          }
+          declared="$(node -p '
+            require("./package.json").repository.url
+              .replace(/^git\+/, "")
+              .replace(/\.git$/, "")
+              .replace("https://github.com/", "")
+          ')"
+          test "$declared" = "$GITHUB_REPOSITORY" || {
+            echo "package.json repository $declared is not $GITHUB_REPOSITORY" >&2
+            exit 1
+          }
+
+      # Both paths run prepublishOnly first: clean, format check, typecheck,
+      # and the full suite. --dry-run does everything but upload.
+      - name: Rehearse the publish
+        if: github.event_name == 'workflow_dispatch'
+        run: npm publish --access public --dry-run
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish
+        if: github.event_name == 'push'
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
