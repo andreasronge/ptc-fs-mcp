@@ -85,6 +85,13 @@ export interface Selector {
    * `write_text_file` names one basename, so it writes into the root itself.
    * A selector that is false here serves files but can never accept a write,
    * which is worth saying at startup rather than once per refused call.
+   *
+   * Includes only, deliberately: false is always the truth, but true is not a
+   * promise, since an exclude can still cover every basename an include
+   * reaches. Deciding that in general is regex intersection, and a diagnostic
+   * that guessed would either miss the same cases or cry wolf over working
+   * read-only roots. The per-call refusal names whichever rule actually
+   * refused.
    */
   readonly servesRootLevel: boolean
 }
