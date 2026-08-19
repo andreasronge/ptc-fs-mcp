@@ -144,7 +144,7 @@ test('openRoot rejects an unusable configuration before serving anything', async
 test('the reported identity matches the published package', () => {
   assert.equal(IDENTITY.name, 'ptc-fs-mcp')
   assert.equal(IDENTITY.version, manifest.version)
-  assert.equal(manifest.name, '@andreasronge/ptc-fs-mcp')
+  assert.equal(manifest.name, 'ptc-fs-mcp')
 })
 
 test('ToolError and ConfigError are exported so a caller can branch on them', () => {

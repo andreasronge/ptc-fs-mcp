@@ -6,7 +6,7 @@
  * `McpServer` so you can connect it to a transport of your own:
  *
  * ```ts
- * import { createServer, openRoot } from '@andreasronge/ptc-fs-mcp'
+ * import { createServer, openRoot } from 'ptc-fs-mcp'
  *
  * const server = createServer(openRoot({ root: './workspace', include: ['**'] }))
  * await server.connect(myTransport)

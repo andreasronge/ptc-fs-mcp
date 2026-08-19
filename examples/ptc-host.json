@@ -7,7 +7,7 @@
         "type": "stdio",
         "command": "npx",
         "cwd": ".",
-        "args": ["-y", "@andreasronge/ptc-fs-mcp@0.1.0", "--root", "reader-state", "--include", "**"],
+        "args": ["-y", "ptc-fs-mcp@0.1.0", "--root", "reader-state", "--include", "**"],
         "start_timeout_ms": 30000,
         "inherit_environment": true,
         "env": {}
@@ -25,7 +25,7 @@
         "type": "stdio",
         "command": "npx",
         "cwd": ".",
-        "args": ["-y", "@andreasronge/ptc-fs-mcp@0.1.0", "--root", "writer-state", "--include", "**"],
+        "args": ["-y", "ptc-fs-mcp@0.1.0", "--root", "writer-state", "--include", "**"],
         "start_timeout_ms": 30000,
         "inherit_environment": true,
         "env": {}

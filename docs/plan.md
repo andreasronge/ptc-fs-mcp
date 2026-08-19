@@ -111,7 +111,7 @@ Publish to npm so host documents can pin a version:
 "transport": {
   "type": "stdio",
   "command": "npx",
-  "args": ["-y", "@andreasronge/ptc-fs-mcp@<version>", "--root", "workspace", "--include", "**"]
+  "args": ["-y", "ptc-fs-mcp@<version>", "--root", "workspace", "--include", "**"]
 }
 ```
 

@@ -14,7 +14,7 @@ configuration rather than runtime code. Nothing in the server is specific to
 PtcRunner — it speaks plain MCP over stdio, so any MCP client can install it.
 
 ```console
-npx -y @andreasronge/ptc-fs-mcp --root ./workspace --include '**'
+npx -y ptc-fs-mcp --root ./workspace --include '**'
 ```
 
 ## Tools
@@ -92,7 +92,7 @@ Install it from a host document by pinning a version:
 "transport": {
   "type": "stdio",
   "command": "npx",
-  "args": ["-y", "@andreasronge/ptc-fs-mcp@0.1.0", "--root", "workspace", "--include", "**"]
+  "args": ["-y", "ptc-fs-mcp@0.1.0", "--root", "workspace", "--include", "**"]
 }
 ```
 
@@ -111,7 +111,7 @@ the root; `createServer` builds the same `McpServer` the binary serves, and you
 give it whatever transport you like.
 
 ```js
-import { createServer, openRoot } from '@andreasronge/ptc-fs-mcp'
+import { createServer, openRoot } from 'ptc-fs-mcp'
 
 const root = openRoot({ root: './workspace', include: ['**'], exclude: ['*.secret'] })
 const server = createServer(root)
