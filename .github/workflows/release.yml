@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+
+      - name: Tag must match the manifest version
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(node -p 'require("./package.json").version')"
+          test "$tagged" = "$declared" || {
+            echo "tag $tagged does not match package.json $declared" >&2
+            exit 1
+          }
+
+      # prepublishOnly reruns format, typecheck, and the full suite.
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,43 @@
+{
+  "install": {
+    "reader_workspace": {
+      "source": "mcp",
+      "installation_revision": "ptc-fs-mcp-reader-v1",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "cwd": ".",
+        "args": ["-y", "@andreasronge/ptc-fs-mcp@0.1.0", "--root", "reader-state", "--include", "**"],
+        "start_timeout_ms": 30000,
+        "inherit_environment": true,
+        "env": {}
+      },
+      "tools": {
+        "read_text_file": { "as": "workspace.read", "effect": "read" },
+        "search_text": { "as": "workspace.search", "effect": "read" }
+      }
+    },
+
+    "writer_workspace": {
+      "source": "mcp",
+      "installation_revision": "ptc-fs-mcp-writer-v1",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "cwd": ".",
+        "args": ["-y", "@andreasronge/ptc-fs-mcp@0.1.0", "--root", "writer-state", "--include", "**"],
+        "start_timeout_ms": 30000,
+        "inherit_environment": true,
+        "env": {}
+      },
+      "tools": {
+        "write_text_file": { "as": "workspace.write", "effect": "write", "model_visible": true }
+      },
+      "ceilings": {
+        "timeout_ms": 15000,
+        "max_catalog_tools": 8,
+        "max_result_bytes": 262144
+      }
+    }
+  }
+}

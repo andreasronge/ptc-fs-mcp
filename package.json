@@ -1,0 +1,57 @@
+{
+  "name": "@andreasronge/ptc-fs-mcp",
+  "version": "0.1.0",
+  "description": "A small filesystem MCP server: read and write files under one confined root, over stdio.",
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "filesystem",
+    "stdio",
+    "ptc-runner"
+  ],
+  "homepage": "https://github.com/andreasronge/ptc-fs-mcp#readme",
+  "bugs": "https://github.com/andreasronge/ptc-fs-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andreasronge/ptc-fs-mcp.git"
+  },
+  "license": "MIT",
+  "author": "Andreas Ronge",
+  "type": "module",
+  "bin": {
+    "ptc-fs-mcp": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.tsbuildinfo"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --build --force",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run build && node --test --test-reporter=spec test/*.test.mjs",
+    "test:coverage": "npm run build && node --test --experimental-test-coverage test/*.test.mjs",
+    "verify": "npm run format:check && npm run typecheck && npm test",
+    "prepublishOnly": "npm run clean && npm run verify"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}
