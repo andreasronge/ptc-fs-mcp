@@ -114,6 +114,25 @@ test('--include is mandatory, so the default is no files', async () => {
   }
 })
 
+test('an include set that cannot reach the root warns rather than refusing to start', async () => {
+  const fixture = makeRoot(FIXTURE)
+  const narrow = startServer(['--root', fixture.root, '--include', 'lib/**'])
+  const whole = startServer(['--root', fixture.root, '--include', '**'])
+  try {
+    // Both serve reads; only the first can never accept a write.
+    await call(narrow, 'list_directory')
+    await call(whole, 'list_directory')
+
+    assert.match(narrow.stderr(), /write_text_file will refuse every call/)
+    assert.equal(narrow.stderr().includes('{"jsonrpc"'), false, 'the warning goes to stderr, the protocol to stdout')
+    assert.equal(whole.stderr(), '', 'a root-level include has nothing to warn about')
+  } finally {
+    await narrow.close()
+    await whole.close()
+    fixture.cleanup()
+  }
+})
+
 test('startup failures are usage errors carrying no stacktrace', async () => {
   for (const [args, pattern] of [
     [['--include', '**'], /--root is required/],

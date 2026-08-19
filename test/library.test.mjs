@@ -182,3 +182,24 @@ test('a selector requires an include and lets an exclude only narrow', () => {
   assert.equal(selector.selects('docs/a.md'), false)
   assert.equal(createSelector([], ['x']).selects('anything'), false, 'the default is no files')
 })
+
+/**
+ * `write_text_file` names one basename, so it writes into the root itself. A
+ * selector reports up front whether any include can reach there, which is what
+ * lets a misconfiguration be named at startup rather than only per refusal.
+ */
+test('a selector reports whether any include can reach the root itself', () => {
+  for (const [include, reachable] of [
+    [['**'], true],
+    [['*'], true],
+    [['*.md'], true],
+    [['**/*.ts'], true, 'zero directories still counts'],
+    [['lib/**'], false],
+    [['lib/**/*.ts'], false],
+    [['docs/**', 'lib/**'], false],
+    [['docs/**', '*.md'], true, 'one reaching pattern is enough'],
+    [[], false, 'the default is no files, so nothing is writable either'],
+  ]) {
+    assert.equal(createSelector(include, []).servesRootLevel, reachable, include.join(' '))
+  }
+})

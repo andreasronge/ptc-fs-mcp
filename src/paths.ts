@@ -60,12 +60,33 @@ export function compileGlob(pattern: string): RegExp {
   return new RegExp(`${source}$`)
 }
 
+/**
+ * True when a glob can match a path with no separator in it -- a file lying
+ * directly in the root.
+ *
+ * This is a property of the pattern, not of any particular path. `**\/`
+ * matches zero directories, so it is dropped before the test; any `/` that
+ * survives is a separator the pattern requires, and a pattern that requires a
+ * separator can never match a basename.
+ */
+export function matchesRootLevel(pattern: string): boolean {
+  return !pattern.split('**/').join('').includes('/')
+}
+
 /** Decides which relative paths a root serves. The default is no files. */
 export interface Selector {
   /** True when the path is inside at least one include and no exclude. */
   readonly selects: (path: string) => boolean
   /** True when the path is excluded, so a directory walk may skip it whole. */
   readonly excludes: (path: string) => boolean
+  /**
+   * True when some include pattern can reach the root's own top level.
+   *
+   * `write_text_file` names one basename, so it writes into the root itself.
+   * A selector that is false here serves files but can never accept a write,
+   * which is worth saying at startup rather than once per refused call.
+   */
+  readonly servesRootLevel: boolean
 }
 
 export function createSelector(include: readonly string[], exclude: readonly string[]): Selector {
@@ -77,5 +98,6 @@ export function createSelector(include: readonly string[], exclude: readonly str
   return {
     selects: (path) => matches(included, path) && !matches(excluded, path),
     excludes: (path) => matches(excluded, path),
+    servesRootLevel: include.some(matchesRootLevel),
   }
 }

@@ -197,6 +197,10 @@ export function openFileForRead(root: Root, path: string): OpenFile {
 /**
  * Replaces one regular file in the root and returns the bytes written.
  *
+ * The name is a single basename, so a write always lands directly in the root
+ * and must be selected by the include rules there -- a write that could not be
+ * read back is a trap rather than a feature.
+ *
  * The destination is confirmed to be a regular file through the descriptor
  * that will be written, not through a separate `stat` that a symlink could
  * outrace. Only then is the file truncated.
@@ -208,8 +212,21 @@ export function writeTextFile(root: Root, basename: string, content: Buffer): nu
   if (content.byteLength > root.limits.maxWriteBytes) {
     throw new ToolError(`content exceeds the ${root.limits.maxWriteBytes}-byte write limit`)
   }
+  // A refusal here names the configuration that caused it. `write_text_file`
+  // writes into the root itself, so an include set that only reaches into
+  // subdirectories refuses every write -- a whole-installation misconfiguration
+  // rather than a fact about this one path, and worth saying so.
+  if (root.selector.excludes(basename)) {
+    throw new ToolError('path matches an --exclude pattern of this root')
+  }
   if (!root.selector.selects(basename)) {
-    throw new ToolError('path is not served by this root')
+    throw new ToolError(
+      root.selector.servesRootLevel
+        ? 'path matches no --include pattern of this root'
+        : 'no --include pattern of this root matches a file in the root itself, so no write can be accepted; ' +
+          'a write names one basename and lands in the root, so add an --include pattern without a directory ' +
+          "prefix, such as '**'",
+    )
   }
 
   let descriptor: number

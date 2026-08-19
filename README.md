@@ -86,15 +86,75 @@ without it exposes nothing. Excluded paths are skipped before any `stat` or
 `open`, so they are never inventoried. Globs match `*` within a segment and
 `**` across segments; `lib/**` selects both `lib/a.ts` and `lib/deep/a.ts`.
 
+**Writes land in the root, so the include rules must reach it.**
+`write_text_file` names one basename, never a directory, so every write goes
+directly into the root. An include set that only reaches into subdirectories —
+`--include 'lib/**'` — serves those files for reading but can accept no write
+at all, and each attempt is refused with `no --include pattern of this root
+matches a file in the root itself`. That is a legitimate configuration for a
+read-only installation, so the server starts anyway and says so on stderr:
+
+```
+ptc-fs-mcp: no --include pattern matches a file in the root itself, so
+write_text_file will refuse every call.
+```
+
+Where the write tool is mapped, use `--include '**'` or add a root-level
+pattern such as `--include '*.md'` alongside the directory ones.
+
 Install it from a host document by pinning a version:
 
 ```json
 "transport": {
   "type": "stdio",
   "command": "npx",
-  "args": ["-y", "ptc-fs-mcp@0.1.0", "--root", "workspace", "--include", "**"]
+  "args": ["-y", "ptc-fs-mcp@0.1.0", "--root", "workspace", "--include", "**"],
+  "inherit_environment": true
 }
 ```
+
+### Spawning without an inherited environment
+
+That form needs `PATH` twice over: `npx` is found on it, and the installed
+binary begins with `#!/usr/bin/env node`, which resolves the interpreter on it
+as well. A host that spawns with a scrubbed environment — PtcRunner's
+`inherit_environment: false`, which its own end-to-end tests use — cannot start
+the server at all, and the failure arrives as an acquisition error such as
+`provider_unavailable` rather than as anything naming `PATH`. Version managers
+make this sharper, not softer: an nvm interpreter lives at a path like
+`~/.nvm/versions/node/v20.19.0/bin/node` and exists nowhere else.
+
+The two configurations are mutually exclusive. To spawn hermetically, install
+the package ahead of time and name the interpreter and the script absolutely,
+bypassing both `npx` and the shebang:
+
+```console
+npm install ptc-fs-mcp@0.1.0
+node -p process.execPath
+node -p "require.resolve('ptc-fs-mcp/package.json').replace(/package\.json$/, 'dist/cli.js')"
+```
+
+```json
+"transport": {
+  "type": "stdio",
+  "command": "/absolute/path/to/bin/node",
+  "args": [
+    "/absolute/path/to/node_modules/ptc-fs-mcp/dist/cli.js",
+    "--root",
+    "/absolute/path/to/workspace",
+    "--include",
+    "**"
+  ],
+  "inherit_environment": false,
+  "env": {}
+}
+```
+
+The server itself needs nothing from the environment: it spawns no process,
+opens no network connection, and reads no variable of its own. `--root` is
+resolved against the working directory, so make it absolute as well unless the
+host sets a `cwd` you control. `hermetic_workspace` in
+[`examples/ptc-host.json`](examples/ptc-host.json) is this form.
 
 ### Splitting authority without splitting servers
 
@@ -153,7 +213,9 @@ Tasks.
   traversal — caps the payload, and confirms the destination is a regular file
   through the descriptor it will write rather than through a separate `stat` a
   symlink could outrace. A destination outside `--include` is refused, because
-  a write you could not read back is a trap rather than a feature.
+  a write you could not read back is a trap rather than a feature. Because a
+  write lands in the root, include rules that reach only into subdirectories
+  refuse every write; see [Running](#running).
 - Path listings are content-blind; content tools refuse what they cannot decode.
   `read_text_file` fails on a file that is not valid UTF-8, and `search_text`
   skips a line whose bytes do not decode, so a line is either reported whole or

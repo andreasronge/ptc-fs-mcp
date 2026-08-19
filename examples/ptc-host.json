@@ -38,6 +38,40 @@
         "max_catalog_tools": 8,
         "max_result_bytes": 262144
       }
+    },
+
+    "hermetic_workspace": {
+      "source": "mcp",
+      "installation_revision": "ptc-fs-mcp-hermetic-v1",
+      "_comment": [
+        "The same server spawned with no inherited environment. npx and the",
+        "#!/usr/bin/env node shebang both resolve through PATH, so neither can",
+        "be used here: run an absolute node against the absolute cli.js of a",
+        "package installed ahead of time. Replace both paths with the output",
+        "of `node -p process.execPath` and of `node -p",
+        "\"require.resolve('ptc-fs-mcp/package.json').replace(/package\\.json$/,",
+        "'dist/cli.js')\"`. --include '**' rather than a directory glob, so",
+        "write_text_file -- which writes one basename into the root -- is",
+        "reachable."
+      ],
+      "transport": {
+        "type": "stdio",
+        "command": "/absolute/path/to/bin/node",
+        "args": [
+          "/absolute/path/to/node_modules/ptc-fs-mcp/dist/cli.js",
+          "--root",
+          "/absolute/path/to/hermetic-state",
+          "--include",
+          "**"
+        ],
+        "start_timeout_ms": 30000,
+        "inherit_environment": false,
+        "env": {}
+      },
+      "tools": {
+        "read_text_file": { "as": "hermetic.read", "effect": "read" },
+        "write_text_file": { "as": "hermetic.write", "effect": "write", "model_visible": true }
+      }
     }
   }
 }

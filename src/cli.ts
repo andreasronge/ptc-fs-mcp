@@ -27,7 +27,13 @@ Options:
   --version               Print the version.
 
 Paths are relative to the root; symbolic links are skipped, never followed.
-Protocol messages go to stdout, diagnostics to stderr.`
+A write names one basename and lands in the root itself, so write_text_file
+needs an --include glob with no directory prefix, such as '**'.
+Protocol messages go to stdout, diagnostics to stderr.
+
+The shebang resolves node through PATH. A host that spawns this without
+inheriting the environment must run an absolute node against an absolute
+dist/cli.js rather than this name or npx.`
 
 export function parseArguments(argv: readonly string[]): RootOptions {
   const include: string[] = []
@@ -73,6 +79,17 @@ export function main(argv: readonly string[]): void {
   }
 
   const root = openRoot(parseArguments(argv))
+  if (!root.selector.servesRootLevel) {
+    // Not fatal: a read-only installation with `--include 'lib/**'` is a
+    // legitimate and common setup, and this process cannot know which tools
+    // the host maps. But if it does map the write tool, every call will be
+    // refused, so the cause is stated once here instead of only in errors.
+    process.stderr.write(
+      'ptc-fs-mcp: no --include pattern matches a file in the root itself, so write_text_file will refuse every ' +
+        "call. Reads are unaffected. Add an --include glob with no directory prefix, such as '**', if this " +
+        'installation maps the write tool.\n',
+    )
+  }
   const transport = serveStdio(() => createServer(root), {
     // The plan's rule, enforced rather than merely documented: this server
     // implements one profile, so a 2025-era opening is refused outright.
