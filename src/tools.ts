@@ -24,13 +24,12 @@ import { normalizeRelative } from './paths.js'
 import { inventory, openFileForRead, writeTextFile, type FileFact, type Root } from './root.js'
 
 const MAX_PAGE = 200
-const MAX_READ_CHUNKS = 8
 const READ_CHUNK_BYTES = 2_048
 const SEARCH_BUFFER_BYTES = 8_192
 const SEARCH_SCAN_BYTES = 262_144
 const MAX_QUERY_BYTES = 256
 const MAX_EVIDENCE_BYTES = 1_024
-const MAX_LOGICAL_RESULT_BYTES = 48_000
+const SIZING_HASH = `sha256:${'0'.repeat(64)}`
 
 /** Where a text scan is paused: a file index and a byte offset inside it. */
 interface SearchPosition {
@@ -53,6 +52,11 @@ interface Candidate<T> {
   readonly bytes: Buffer
 }
 
+interface ResultBudget {
+  readonly maxBytes: number
+  readonly identity: ServerIdentity
+}
+
 export interface ServerIdentity {
   readonly name: string
   readonly version: string
@@ -63,18 +67,17 @@ export interface ServerIdentity {
  * server in its own process instead of spawning the stdio binary.
  */
 export function createServer(root: Root, identity: ServerIdentity): McpServer {
-  const server = new McpServer(
-    { name: identity.name, version: identity.version },
-    {
-      instructions:
-        'Read and write files under one confined root. Paths are relative to that root. Reads reflect the ' +
-        'filesystem at call time, so a write is visible to the next read. Follow next_cursor until it is null; a ' +
-        'cursor is rejected if the data it was issued against changed.',
-    },
-  )
+  const serverIdentity: ServerIdentity = { name: identity.name, version: identity.version }
+  const server = new McpServer(serverIdentity, {
+    instructions:
+      'Read and write files under one confined root. Paths are relative to that root. Reads reflect the ' +
+      'filesystem at call time, so a write is visible to the next read. Follow next_cursor until it is null; a ' +
+      'cursor is rejected if the data it was issued against changed.',
+  })
 
   const meta = { 'io.modelcontextprotocol/cacheScope': 'private' as const }
   const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  const resultBudget: ResultBudget = { maxBytes: root.limits.maxResultBytes, identity: serverIdentity }
 
   server.registerTool(
     'list_directory',
@@ -103,7 +106,7 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         position: index + 1,
         bytes: Buffer.from(`${item.kind}\0${item.path}\n`, 'utf8'),
       }))
-      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit)))
+      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
     },
   )
 
@@ -139,7 +142,7 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         position: index + 1,
         bytes: Buffer.from(`${path}\n`, 'utf8'),
       }))
-      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit)))
+      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
     },
   )
 
@@ -182,7 +185,7 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         first,
       )
       const scan = scanText(root, files, query, start, boundedPage(args.limit))
-      return structured(pageValue(scope, state, start, scan.candidates, scan.next))
+      return structured(pageValue(scope, state, start, scan.candidates, scan.next, resultBudget))
     },
   )
 
@@ -201,7 +204,11 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         properties: {
           path: { type: 'string', minLength: 1 },
           cursor: { type: 'string' },
-          limit: { type: 'integer', minimum: 1, maximum: MAX_READ_CHUNKS },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: Math.ceil(root.limits.maxReadBytes / READ_CHUNK_BYTES),
+          },
         },
         required: ['path'],
         additionalProperties: false,
@@ -215,8 +222,11 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         const scope = scopeOf('read_text_file', { path })
         const state = stateOf([file.identity])
         const offset = decodeCursor(scope, state, args.cursor, isOffset, 0)
-        const limit = boundedPage(args.limit, MAX_READ_CHUNKS)
-        return structured(readPage(file.descriptor, file.bytes, scope, state, offset, limit))
+        const maxChunks = Math.ceil(root.limits.maxReadBytes / READ_CHUNK_BYTES)
+        const limit = boundedPage(args.limit, maxChunks)
+        return structured(
+          readPage(file.descriptor, file.bytes, scope, state, offset, limit, root.limits.maxReadBytes, resultBudget),
+        )
       } finally {
         closeSync(file.descriptor)
       }
@@ -291,13 +301,22 @@ function directoryEntries(root: Root, prefix: string): Array<{ name: string; kin
     .map(([name, kind]) => ({ name, kind, path: scope + name }))
 }
 
-function readPage(descriptor: number, size: number, scope: string, state: string, offset: number, limit: number) {
+function readPage(
+  descriptor: number,
+  size: number,
+  scope: string,
+  state: string,
+  offset: number,
+  limit: number,
+  maxReadBytes: number,
+  resultBudget: ResultBudget,
+) {
   if (offset > size) throw new ToolError('cursor position is not valid')
   const candidates: Array<Candidate<{ byte_offset: number; text: string }>> = []
   let position = offset
 
-  while (position < size && candidates.length < limit) {
-    const requested = Math.min(READ_CHUNK_BYTES, size - position)
+  while (position < size && position - offset < maxReadBytes && candidates.length < limit) {
+    const requested = Math.min(READ_CHUNK_BYTES, size - position, maxReadBytes - (position - offset))
     const buffer = Buffer.allocUnsafe(requested)
     const count = readSync(descriptor, buffer, 0, requested, position)
     if (count <= 0) throw new ToolError('read failed')
@@ -305,7 +324,11 @@ function readPage(descriptor: number, size: number, scope: string, state: string
     const bytes = buffer.subarray(0, count)
     const atEnd = position + count === size
     const safeLength = validUtf8Prefix(bytes)
-    if (safeLength <= 0 || (atEnd && safeLength !== count)) throw new ToolError('file is not valid UTF-8')
+    if (safeLength <= 0) {
+      if (!atEnd && candidates.length > 0) break
+      throw new ToolError('file is not valid UTF-8')
+    }
+    if (atEnd && safeLength !== count) throw new ToolError('file is not valid UTF-8')
 
     const chunk = bytes.subarray(0, safeLength)
     candidates.push({
@@ -316,7 +339,7 @@ function readPage(descriptor: number, size: number, scope: string, state: string
     position += safeLength
   }
 
-  return pageValue(scope, state, offset, candidates, position < size ? position : null)
+  return pageValue(scope, state, offset, candidates, position < size ? position : null, resultBudget)
 }
 
 /**
@@ -483,15 +506,23 @@ function arrayPage<T>(
   candidates: readonly Candidate<T>[],
   offset: number,
   limit: number,
+  resultBudget: ResultBudget,
 ) {
   if (offset > candidates.length) throw new ToolError('cursor position is not valid')
   const end = Math.min(offset + limit, candidates.length)
-  return pageValue(scope, state, offset, candidates.slice(offset, end), end < candidates.length ? end : null)
+  return pageValue(
+    scope,
+    state,
+    offset,
+    candidates.slice(offset, end),
+    end < candidates.length ? end : null,
+    resultBudget,
+  )
 }
 
 /**
- * Fits a page under the result ceiling, dropping items from the end and
- * reissuing the cursor so nothing is lost -- only deferred.
+ * Fits the largest candidate prefix under the decoded-result ceiling. Sizing
+ * uses a fixed-length placeholder hash, then the chosen prefix is hashed once.
  */
 function pageValue<T>(
   scope: string,
@@ -499,27 +530,37 @@ function pageValue<T>(
   start: unknown,
   candidates: readonly Candidate<T>[],
   finalPosition: unknown,
+  resultBudget: ResultBudget,
 ) {
-  const kept = [...candidates]
-
-  while (true) {
-    const next =
-      kept.length === candidates.length ? finalPosition : kept.length === 0 ? start : kept[kept.length - 1]!.position
-    const value = {
-      items: kept.map((candidate) => candidate.item),
+  const valueFor = (count: number, contentHash: string) => {
+    const next = count === candidates.length ? finalPosition : count === 0 ? start : candidates[count - 1]!.position
+    return {
+      items: candidates.slice(0, count).map((candidate) => candidate.item),
       next_cursor: next === null ? null : encodeCursor(scope, state, next),
-      content_hash: digest(kept.map((candidate) => candidate.bytes)),
+      content_hash: contentHash,
     }
-
-    if (logicalResultBytes(value) <= MAX_LOGICAL_RESULT_BYTES) {
-      if (kept.length === 0 && candidates.length > 0) {
-        throw new ToolError('one result item exceeds the result ceiling')
-      }
-      return value
-    }
-    if (kept.length === 0) throw new ToolError('one result item exceeds the result ceiling')
-    kept.pop()
   }
+
+  const fits = (count: number): boolean =>
+    logicalResultBytes(valueFor(count, SIZING_HASH), resultBudget.identity) <= resultBudget.maxBytes
+
+  if (fits(candidates.length)) {
+    return valueFor(candidates.length, digest(candidates.map((candidate) => candidate.bytes)))
+  }
+  if (!fits(0)) throw new ToolError('result ceiling is too small')
+
+  let low = 0
+  let high = candidates.length - 1
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (fits(middle)) low = middle
+    else high = middle - 1
+  }
+
+  if (low === 0 && candidates.length > 0) {
+    throw new ToolError('one result item exceeds the result ceiling')
+  }
+  return valueFor(low, digest(candidates.slice(0, low).map((candidate) => candidate.bytes)))
 }
 
 /** The digest of the bytes a call returned. A citation names these, not a tree. */
@@ -551,8 +592,15 @@ function structured(value: Record<string, unknown>) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], structuredContent: value }
 }
 
-function logicalResultBytes(value: Record<string, unknown>): number {
-  return Buffer.byteLength(JSON.stringify(structured(value)), 'utf8')
+function logicalResultBytes(value: Record<string, unknown>, identity: ServerIdentity): number {
+  return Buffer.byteLength(
+    JSON.stringify({
+      ...structured(value),
+      resultType: 'complete',
+      _meta: { 'io.modelcontextprotocol/serverInfo': identity },
+    }),
+    'utf8',
+  )
 }
 
 function requirePath(value: unknown, field: string): string {

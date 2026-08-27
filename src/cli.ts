@@ -22,6 +22,11 @@ Options:
   --exclude <glob>        Never serve paths matching this glob. Repeatable.
                           May only narrow what --include selected.
   --max-file-bytes <n>    Do not serve files larger than this.
+  --max-read-bytes <n>    Source bytes considered per read page. Default 16384.
+  --max-result-bytes <n>  Complete decoded tool result ceiling. Default 48000.
+                          Valid range 48000-1048576. Must not exceed the
+                          consumer's effective limit; consumers below 48000
+                          bytes are unsupported.
   --max-write-bytes <n>   Largest write_text_file payload. Default 65536.
   --help                  Print this message.
   --version               Print the version.
@@ -52,6 +57,8 @@ export function parseArguments(argv: readonly string[]): RootOptions {
     else if (flag === '--include') include.push(value)
     else if (flag === '--exclude') exclude.push(value)
     else if (flag === '--max-file-bytes') limits.maxFileBytes = positiveInteger(value, flag)
+    else if (flag === '--max-read-bytes') limits.maxReadBytes = positiveInteger(value, flag)
+    else if (flag === '--max-result-bytes') limits.maxResultBytes = positiveInteger(value, flag)
     else if (flag === '--max-write-bytes') limits.maxWriteBytes = positiveInteger(value, flag)
     else throw new ConfigError(`unknown option ${flag}`)
     index += 1

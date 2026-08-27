@@ -73,13 +73,34 @@ only cover a bounded capture, and this server does not take one.
 ptc-fs-mcp --root ./workspace --include 'lib/**' --include 'docs/**' --exclude '**/secrets/**'
 ```
 
-| Option                  | Meaning                                                  |
-| ----------------------- | -------------------------------------------------------- |
-| `--root <dir>`          | Directory to confine to. Required.                       |
-| `--include <glob>`      | Serve matching paths. Required, repeatable.              |
-| `--exclude <glob>`      | Never serve matching paths. Repeatable; may only narrow. |
-| `--max-file-bytes <n>`  | Do not serve files larger than this.                     |
-| `--max-write-bytes <n>` | Largest `write_text_file` payload. Default 65536.        |
+| Option                   | Meaning                                                  |
+| ------------------------ | -------------------------------------------------------- |
+| `--root <dir>`           | Directory to confine to. Required.                       |
+| `--include <glob>`       | Serve matching paths. Required, repeatable.              |
+| `--exclude <glob>`       | Never serve matching paths. Repeatable; may only narrow. |
+| `--max-file-bytes <n>`   | Do not serve files larger than this.                     |
+| `--max-read-bytes <n>`   | Source bytes considered per read page. Default 16384.    |
+| `--max-result-bytes <n>` | Complete decoded tool result ceiling. Default 48000.     |
+| `--max-write-bytes <n>`  | Largest `write_text_file` payload. Default 65536.        |
+
+Read pages obey both byte budgets. `--max-read-bytes` bounds bytes from the
+source file, while `--max-result-bytes` bounds the complete decoded MCP tool
+result, including both `content` and `structuredContent`. Text therefore costs
+more result bytes than source bytes, especially when JSON escaping is needed.
+The result ceiling remains authoritative and may shorten a page below the read
+budget. Both options accept at most 1048576 bytes; `--max-read-bytes` accepts a
+minimum of 4 and `--max-result-bytes` a minimum of 48000. The result minimum
+keeps one worst-case escaped 2048-byte internal text chunk representable.
+Set `--max-result-bytes` no higher than the consumer's effective decoded-result
+limit; consumers below 48000 bytes are unsupported. When the limit is unknown,
+keep the default.
+
+For a consumer with a 1000000-byte decoded-result limit, a representative
+large-page configuration is:
+
+```console
+ptc-fs-mcp --root ./workspace --include '**' --max-read-bytes 500000 --max-result-bytes 1000000
+```
 
 `--include` is mandatory and the default is **no files**, so a server started
 without it exposes nothing. Excluded paths are skipped before any `stat` or

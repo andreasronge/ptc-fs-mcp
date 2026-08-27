@@ -21,9 +21,16 @@ export interface Limits {
   readonly maxEntries: number
   /** Files larger than this are not served at all, in listings or in reads. */
   readonly maxFileBytes: number
+  /** Source-file bytes considered for one `read_text_file` page. */
+  readonly maxReadBytes: number
+  /** Complete decoded MCP result bytes allowed for any tool call. */
+  readonly maxResultBytes: number
   /** The largest `write_text_file` payload, in UTF-8 bytes. */
   readonly maxWriteBytes: number
 }
+
+export const MAX_CONFIGURED_READ_BYTES = 1_048_576
+export const MAX_CONFIGURED_RESULT_BYTES = 1_048_576
 
 export const DEFAULT_LIMITS: Limits = {
   maxFiles: 4_096,
@@ -31,6 +38,8 @@ export const DEFAULT_LIMITS: Limits = {
   maxDirectories: 8_192,
   maxEntries: 100_000,
   maxFileBytes: Number.MAX_SAFE_INTEGER,
+  maxReadBytes: 16_384,
+  maxResultBytes: 48_000,
   maxWriteBytes: 65_536,
 }
 
@@ -256,12 +265,18 @@ function validateLimits(limits: Limits): void {
     limits.maxDirectories,
     limits.maxEntries,
     limits.maxFileBytes,
+    limits.maxReadBytes,
+    limits.maxResultBytes,
     limits.maxWriteBytes,
   ]
   if (
     positive.some((value) => !Number.isSafeInteger(value) || value < 1) ||
     !Number.isSafeInteger(limits.maxDepth) ||
-    limits.maxDepth < 0
+    limits.maxDepth < 0 ||
+    limits.maxReadBytes < 4 ||
+    limits.maxReadBytes > MAX_CONFIGURED_READ_BYTES ||
+    limits.maxResultBytes < DEFAULT_LIMITS.maxResultBytes ||
+    limits.maxResultBytes > MAX_CONFIGURED_RESULT_BYTES
   ) {
     throw new ConfigError('limits are not valid')
   }

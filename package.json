@@ -1,6 +1,6 @@
 {
   "name": "ptc-fs-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A small filesystem MCP server: read and write files under one confined root, over stdio.",
   "keywords": [
     "mcp",

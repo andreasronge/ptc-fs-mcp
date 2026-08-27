@@ -138,6 +138,10 @@ test('startup failures are usage errors carrying no stacktrace', async () => {
     [['--include', '**'], /--root is required/],
     [['--root', '/nonexistent-ptc-fs-mcp', '--include', '**'], /root does not exist/],
     [['--root', '.', '--include', '**', '--max-write-bytes', 'x'], /positive integer/],
+    [['--root', '.', '--include', '**', '--max-read-bytes', '3'], /limits are not valid/],
+    [['--root', '.', '--include', '**', '--max-read-bytes', '1048577'], /limits are not valid/],
+    [['--root', '.', '--include', '**', '--max-result-bytes', '47999'], /limits are not valid/],
+    [['--root', '.', '--include', '**', '--max-result-bytes', '1048577'], /limits are not valid/],
     [['--root', '.', '--include', '**', '--nope', 'x'], /unknown option/],
   ]) {
     const server = startServer(args)
@@ -151,7 +155,10 @@ test('startup failures are usage errors carrying no stacktrace', async () => {
 
 test('--help and --version print and exit successfully', async () => {
   for (const [flag, pattern] of [
-    ['--help', /Usage:\s+ptc-fs-mcp/],
+    [
+      '--help',
+      /Usage:\s+ptc-fs-mcp[\s\S]+--max-result-bytes[\s\S]+Valid range 48000-1048576[\s\S]+consumers below 48000[\s\S]+unsupported/,
+    ],
     ['--version', /^\d+\.\d+\.\d+/],
   ]) {
     const child = spawn(process.execPath, [BINARY, flag], { stdio: ['ignore', 'pipe', 'pipe'] })

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 
-import { call, callFailing, collect, FIXTURE, withFixture, withRoot } from './helpers/harness.mjs'
+import { call, callFailing, collect, FIXTURE, startServer, withFixture, withRoot } from './helpers/harness.mjs'
 
 const sha256 = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`
 
@@ -12,6 +12,98 @@ test('a read reconstructs the file exactly across pages', async () => {
     assert.equal(chunks.map((chunk) => chunk.text).join(''), FIXTURE['lib/alpha.ex'])
     assert.equal(chunks[0].byte_offset, 0)
   })
+})
+
+test('the default read page remains capped at 16,384 source bytes', async () => {
+  const text = 'x'.repeat(20_000)
+
+  await withRoot({ 'large.txt': text }, async (server) => {
+    const page = await call(server, 'read_text_file', { path: 'large.txt' })
+    assert.equal(Buffer.byteLength(page.items.map((chunk) => chunk.text).join(''), 'utf8'), 16_384)
+    assert.notEqual(page.next_cursor, null)
+  })
+})
+
+test('configured read and decoded-result budgets allow a large page', async () => {
+  const text = 'x'.repeat(600_000)
+
+  await withRoot(
+    { 'large.txt': text },
+    async (server) => {
+      const response = await server.request('tools/call', {
+        name: 'read_text_file',
+        arguments: { path: 'large.txt' },
+      })
+      const page = response.result.structuredContent
+
+      assert.equal(Buffer.byteLength(page.items.map((chunk) => chunk.text).join(''), 'utf8'), 500_000)
+      assert.ok(Buffer.byteLength(JSON.stringify(response.result), 'utf8') <= 1_048_576)
+      assert.notEqual(page.next_cursor, null)
+    },
+    ['--include', '**', '--max-read-bytes', '500000', '--max-result-bytes', '1048576'],
+  )
+})
+
+test('the decoded-result budget remains authoritative over the source-byte budget', async () => {
+  const text = 'x'.repeat(200_000)
+
+  await withRoot(
+    { 'large.txt': text },
+    async (server) => {
+      const response = await server.request('tools/call', {
+        name: 'read_text_file',
+        arguments: { path: 'large.txt' },
+      })
+      const page = response.result.structuredContent
+      const returned = Buffer.byteLength(page.items.map((chunk) => chunk.text).join(''), 'utf8')
+
+      assert.ok(returned < 200_000, 'the result budget must be able to shorten a source page')
+      assert.ok(Buffer.byteLength(JSON.stringify(response.result), 'utf8') <= 100_000)
+      assert.notEqual(page.next_cursor, null)
+    },
+    ['--include', '**', '--max-read-bytes', '200000', '--max-result-bytes', '100000'],
+  )
+})
+
+test('the decoded-result budget includes fields added by the MCP server SDK', async () => {
+  const text = 'x'.repeat(30_000)
+
+  await withRoot(
+    { 'large.txt': text },
+    async (server, root) => {
+      const full = await server.request('tools/call', {
+        name: 'read_text_file',
+        arguments: { path: 'large.txt' },
+      })
+      const exactBytes = Buffer.byteLength(JSON.stringify(full.result), 'utf8')
+      assert.equal(full.result.structuredContent.next_cursor, null)
+      assert.ok(exactBytes > 48_000)
+
+      const bounded = startServer([
+        '--root',
+        root,
+        '--include',
+        '**',
+        '--max-read-bytes',
+        '30000',
+        '--max-result-bytes',
+        String(exactBytes - 1),
+      ])
+      try {
+        const response = await bounded.request('tools/call', {
+          name: 'read_text_file',
+          arguments: { path: 'large.txt' },
+        })
+        assert.equal(response.error, undefined)
+        assert.notEqual(response.result?.isError, true, JSON.stringify(response.result))
+        assert.ok(Buffer.byteLength(JSON.stringify(response.result), 'utf8') <= exactBytes - 1)
+        assert.notEqual(response.result.structuredContent.next_cursor, null)
+      } finally {
+        await bounded.close()
+      }
+    },
+    ['--include', '**', '--max-read-bytes', '30000', '--max-result-bytes', '1048576'],
+  )
 })
 
 test('content_hash is the digest of the bytes that call returned', async () => {
@@ -67,6 +159,20 @@ test('a scalar straddling the chunk boundary is emitted whole', async () => {
       'no replacement character may appear',
     )
   })
+})
+
+test('a configured source-byte boundary defers rather than splits a UTF-8 scalar', async () => {
+  const text = `a${String.fromCodePoint(0x1f642)}bc`
+
+  await withRoot(
+    { 'boundary.txt': text },
+    async (server) => {
+      const chunks = await collect(server, 'read_text_file', { path: 'boundary.txt' })
+      assert.equal(chunks.map((chunk) => chunk.text).join(''), text)
+      assert.ok(chunks.every((chunk) => !chunk.text.includes('\ufffd')))
+    },
+    ['--include', '**', '--max-read-bytes', '4'],
+  )
 })
 
 test('escape-heavy pages stay under the decoded result ceiling', async () => {
@@ -157,4 +263,27 @@ test('listings are sorted and paginate through an opaque cursor', async () => {
     const ordered = [first.items[0].path, second.items[0].path]
     assert.deepEqual([...ordered].sort(), ordered, 'pages must follow sorted order')
   })
+})
+
+test('a complete page is kept when null makes it smaller than an intermediate cursor page', async () => {
+  const files = Object.fromEntries([
+    ...Array.from({ length: 99 }, (_, index) => {
+      const prefix = `a${String(index).padStart(3, '0')}`
+      return [`${prefix}${'x'.repeat(90)}.txt`, 'x']
+    }),
+    ['z.txt', 'x'],
+  ])
+
+  await withRoot(
+    files,
+    async (server) => {
+      const response = await server.request('tools/call', { name: 'list_directory', arguments: {} })
+      assert.equal(response.error, undefined)
+      assert.notEqual(response.result?.isError, true, JSON.stringify(response.result))
+      assert.equal(response.result.structuredContent.items.length, 100)
+      assert.equal(response.result.structuredContent.next_cursor, null)
+      assert.ok(Buffer.byteLength(JSON.stringify(response.result), 'utf8') <= 48_000)
+    },
+    ['--include', '**', '--max-result-bytes', '48000'],
+  )
 })

@@ -32,8 +32,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 const manifest = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
 
 /** Connects an in-process server and returns a one-shot request function. */
-async function connect(root) {
-  const server = createServer(openRoot(root))
+async function connect(root, identity) {
+  const server = createServer(openRoot(root), identity)
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair()
   await server.connect(serverSide)
   await clientSide.start()
@@ -124,6 +124,22 @@ test('two servers over one root can be given different authority', async () => {
   }
 })
 
+test('a custom identity is normalized once for both serving and result sizing', async () => {
+  const fixture = makeRoot({ 'note.txt': 'hello\n' })
+  const identity = { name: 'custom-server', version: '1', build: 1n }
+  const client = await connect({ root: fixture.root, include: ['**'] }, identity)
+
+  try {
+    identity.name = 'mutated-after-construction'
+    const response = await client.call('read_text_file', { path: 'note.txt' })
+    assert.equal(response.result?.isError, undefined)
+    assert.equal(response.result.structuredContent.items.map((chunk) => chunk.text).join(''), 'hello\n')
+  } finally {
+    await client.close()
+    fixture.cleanup()
+  }
+})
+
 test('openRoot rejects an unusable configuration before serving anything', async () => {
   const fixture = makeRoot({ 'a.txt': 'x\n' })
 
@@ -132,9 +148,27 @@ test('openRoot rejects an unusable configuration before serving anything', async
     assert.throws(() => openRoot({ root: join(fixture.root, 'missing'), include: ['**'] }), ConfigError)
     assert.throws(() => openRoot({ root: join(fixture.root, 'a.txt'), include: ['**'] }), ConfigError)
     assert.throws(() => openRoot({ root: fixture.root, include: ['**'], limits: { maxFiles: 0 } }), ConfigError)
+    assert.throws(() => openRoot({ root: fixture.root, include: ['**'], limits: { maxReadBytes: 3 } }), ConfigError)
+    assert.throws(
+      () => openRoot({ root: fixture.root, include: ['**'], limits: { maxResultBytes: 47_999 } }),
+      ConfigError,
+    )
+    assert.throws(
+      () => openRoot({ root: fixture.root, include: ['**'], limits: { maxResultBytes: 1_048_577 } }),
+      ConfigError,
+    )
 
     const root = openRoot({ root: fixture.root, include: ['**'] })
+    const larger = openRoot({
+      root: fixture.root,
+      include: ['**'],
+      limits: { maxReadBytes: 500_000, maxResultBytes: 1_048_576 },
+    })
+    assert.equal(root.limits.maxReadBytes, DEFAULT_LIMITS.maxReadBytes)
+    assert.equal(root.limits.maxResultBytes, DEFAULT_LIMITS.maxResultBytes)
     assert.equal(root.limits.maxWriteBytes, DEFAULT_LIMITS.maxWriteBytes)
+    assert.equal(larger.limits.maxReadBytes, 500_000)
+    assert.equal(larger.limits.maxResultBytes, 1_048_576)
     assert.equal(root.selector.selects('a.txt'), true)
   } finally {
     fixture.cleanup()
