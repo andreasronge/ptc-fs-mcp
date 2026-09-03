@@ -153,6 +153,24 @@ test('startup failures are usage errors carrying no stacktrace', async () => {
   }
 })
 
+test('invalid deterministic cursor credentials fail startup without echoing the value', async () => {
+  for (const [value, pattern] of [
+    [undefined, /missing, empty, or malformed/],
+    ['', /missing, empty, or malformed/],
+    ['not+base64url', /missing, empty, or malformed/],
+    [Buffer.alloc(31, 4).toString('base64url'), /fewer than 32 bytes/],
+  ]) {
+    const server = startServer(
+      ['--root', '.', '--include', '**', '--cursor-key-env', 'TEST_CURSOR_SECRET'],
+      value === undefined ? { unsetEnv: ['TEST_CURSOR_SECRET'] } : { env: { TEST_CURSOR_SECRET: value } },
+    )
+    const code = await new Promise((resolve) => server.child.once('exit', resolve))
+    assert.equal(code, 64)
+    assert.match(server.stderr(), pattern)
+    if (value) assert.equal(server.stderr().includes(value), false)
+  }
+})
+
 test('--help and --version print and exit successfully', async () => {
   for (const [flag, pattern] of [
     [

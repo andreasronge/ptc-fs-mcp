@@ -16,12 +16,21 @@
 
 import { createHash } from 'node:crypto'
 import { closeSync, readSync } from 'node:fs'
+import { types } from 'node:util'
 import { fromJsonSchema, McpServer, type JsonSchemaType } from '@modelcontextprotocol/server'
 
-import { ToolError } from './errors.js'
-import { decodeCursor, encodeCursor, scopeOf, stateOf } from './cursor.js'
+import { createCursorCodec, PROCESS_CURSOR_CODEC, scopeOf, stateOf, type CursorCodec } from './cursor.js'
+import { ConfigError, ToolError } from './errors.js'
 import { normalizeRelative } from './paths.js'
-import { inventory, openFileForRead, writeTextFile, type FileFact, type Root } from './root.js'
+import {
+  assertOpenFileIdentity,
+  inventory,
+  openFileForRead,
+  writeTextFile,
+  type FileFact,
+  type OpenFile,
+  type Root,
+} from './root.js'
 
 const MAX_PAGE = 200
 const READ_CHUNK_BYTES = 2_048
@@ -62,11 +71,33 @@ export interface ServerIdentity {
   readonly version: string
 }
 
+export interface ServerOptions {
+  /** Stable HMAC key enabling replay-safe deterministic cursors. Minimum 32 bytes. */
+  readonly cursorKey?: Uint8Array
+  /** Maximum file bytes hashed to establish semantic cursor state in one call. */
+  readonly maxCursorHashBytes?: number
+}
+
+const DEFAULT_MAX_CURSOR_HASH_BYTES = 16_777_216
+
 /**
  * Builds the MCP server for one live root. Exported so a host can embed the
  * server in its own process instead of spawning the stdio binary.
  */
-export function createServer(root: Root, identity: ServerIdentity): McpServer {
+export function createServer(root: Root, identity: ServerIdentity, options: ServerOptions = {}): McpServer {
+  let cursorKey: Buffer | undefined
+  if (options.cursorKey !== undefined) {
+    if (!types.isUint8Array(options.cursorKey)) throw new ConfigError('cursor key must be a byte array')
+    cursorKey = Buffer.from(options.cursorKey)
+    if (cursorKey.byteLength < 32) throw new ConfigError('cursor key must contain at least 32 bytes')
+  }
+  const maxCursorHashBytes = options.maxCursorHashBytes ?? DEFAULT_MAX_CURSOR_HASH_BYTES
+  if (!Number.isSafeInteger(maxCursorHashBytes) || maxCursorHashBytes < 1) {
+    throw new ConfigError('maxCursorHashBytes must be a positive integer')
+  }
+  const deterministic = cursorKey !== undefined
+  const cursors = cursorKey === undefined ? PROCESS_CURSOR_CODEC : createCursorCodec(cursorKey)
+  const digestCache = new Map<string, { bytes: number; digest: string }>()
   const serverIdentity: ServerIdentity = { name: identity.name, version: identity.version }
   const server = new McpServer(serverIdentity, {
     instructions:
@@ -100,13 +131,13 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
       const items = directoryEntries(root, prefix)
       const scope = scopeOf('list_directory', { path: prefix })
       const state = stateOf(items.map((entry) => `${entry.kind}\0${entry.path}`))
-      const offset = decodeCursor(scope, state, args.cursor, isOffset, 0)
+      const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
       const candidates = items.map((item, index) => ({
         item,
         position: index + 1,
         bytes: Buffer.from(`${item.kind}\0${item.path}\n`, 'utf8'),
       }))
-      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
+      return structured(arrayPage(cursors, scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
     },
   )
 
@@ -136,13 +167,13 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
         .filter((path) => path.includes(query))
       const scope = scopeOf('search_files', { query })
       const state = stateOf(paths)
-      const offset = decodeCursor(scope, state, args.cursor, isOffset, 0)
+      const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
       const candidates = paths.map((path, index) => ({
         item: { path },
         position: index + 1,
         bytes: Buffer.from(`${path}\n`, 'utf8'),
       }))
-      return structured(arrayPage(scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
+      return structured(arrayPage(cursors, scope, state, candidates, offset, boundedPage(args.limit), resultBudget))
     },
   )
 
@@ -173,19 +204,22 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
       const prefix = args.path === undefined ? '' : requirePath(args.path, 'path')
       const files = inventory(root, prefix)
       const scope = scopeOf('search_text', { path: prefix, query })
-      // Content is what a text search tears on, so the scan binds each file's
-      // inode observation as well as the set of paths.
-      const state = stateOf(files.map((file) => `${file.path}\0${file.identity}`))
+      // Content is what a text search tears on. Default mode binds physical
+      // observations; deterministic mode binds semantic content identities.
+      const stateFiles = deterministic
+        ? semanticFiles(root, files, maxCursorHashBytes, digestCache, root.limits.maxFiles)
+        : files.map((file) => ({ file, identity: file.identity }))
+      const state = stateOf(stateFiles.map(({ file, identity }) => `${file.path}\0${identity}`))
       const first: SearchPosition = { file: 0, offset: 0, lineStart: 0, line: 1, matched: false }
-      const start = decodeCursor(
+      const start = cursors.decode(
         scope,
         state,
         args.cursor,
         (value): value is SearchPosition => isSearchPosition(value, files.length),
         first,
       )
-      const scan = scanText(root, files, query, start, boundedPage(args.limit))
-      return structured(pageValue(scope, state, start, scan.candidates, scan.next, resultBudget))
+      const scan = scanText(root, files, query, start, boundedPage(args.limit), deterministic)
+      return structured(pageValue(cursors, scope, state, start, scan.candidates, scan.next, resultBudget))
     },
   )
 
@@ -220,13 +254,26 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
       const file = openFileForRead(root, path)
       try {
         const scope = scopeOf('read_text_file', { path })
-        const state = stateOf([file.identity])
-        const offset = decodeCursor(scope, state, args.cursor, isOffset, 0)
+        const semanticIdentity = deterministic
+          ? `${file.bytes}:${contentDigest(file, { remaining: maxCursorHashBytes }, digestCache, root.limits.maxFiles)}`
+          : file.identity
+        const state = stateOf([semanticIdentity])
+        const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
         const maxChunks = Math.ceil(root.limits.maxReadBytes / READ_CHUNK_BYTES)
         const limit = boundedPage(args.limit, maxChunks)
-        return structured(
-          readPage(file.descriptor, file.bytes, scope, state, offset, limit, root.limits.maxReadBytes, resultBudget),
+        const page = readPage(
+          cursors,
+          file.descriptor,
+          file.bytes,
+          scope,
+          state,
+          offset,
+          limit,
+          root.limits.maxReadBytes,
+          resultBudget,
         )
+        assertOpenFileIdentity(file)
+        return structured(page)
       } finally {
         closeSync(file.descriptor)
       }
@@ -277,6 +324,62 @@ export function createServer(root: Root, identity: ServerIdentity): McpServer {
   return server
 }
 
+interface HashBudget {
+  remaining: number
+}
+
+function semanticFiles(
+  root: Root,
+  files: readonly FileFact[],
+  maximum: number,
+  cache: Map<string, { bytes: number; digest: string }>,
+  maxCacheEntries: number,
+): Array<{ file: FileFact; identity: string }> {
+  const budget = { remaining: maximum }
+  return files.map((file) => {
+    const open = openFileForRead(root, file.path)
+    try {
+      if (open.identity !== file.identity) throw new ToolError('filesystem changed while reading')
+      return { file, identity: `${open.bytes}:${contentDigest(open, budget, cache, maxCacheEntries)}` }
+    } finally {
+      closeSync(open.descriptor)
+    }
+  })
+}
+
+function contentDigest(
+  file: OpenFile,
+  budget: HashBudget,
+  cache: Map<string, { bytes: number; digest: string }>,
+  maxCacheEntries: number,
+): string {
+  const cached = cache.get(file.identity)
+  if (cached?.bytes === file.bytes) return cached.digest
+  if (file.bytes > budget.remaining) {
+    throw new ToolError('deterministic cursor hashing exceeds the configured byte ceiling')
+  }
+
+  const hash = createHash('sha256')
+  const buffer = Buffer.allocUnsafe(Math.min(65_536, Math.max(file.bytes, 1)))
+  let offset = 0
+  while (offset < file.bytes) {
+    const wanted = Math.min(buffer.length, file.bytes - offset)
+    const count = readSync(file.descriptor, buffer, 0, wanted, offset)
+    if (count <= 0) throw new ToolError('read failed')
+    hash.update(buffer.subarray(0, count))
+    offset += count
+  }
+  assertOpenFileIdentity(file)
+  budget.remaining -= file.bytes
+  const digest = hash.digest('hex')
+  if (cache.size >= maxCacheEntries) {
+    const oldest = cache.keys().next().value as string | undefined
+    if (oldest !== undefined) cache.delete(oldest)
+  }
+  cache.set(file.identity, { bytes: file.bytes, digest })
+  return digest
+}
+
 /**
  * Derives one directory level from the selected files beneath it.
  *
@@ -302,6 +405,7 @@ function directoryEntries(root: Root, prefix: string): Array<{ name: string; kin
 }
 
 function readPage(
+  cursors: CursorCodec,
   descriptor: number,
   size: number,
   scope: string,
@@ -339,7 +443,7 @@ function readPage(
     position += safeLength
   }
 
-  return pageValue(scope, state, offset, candidates, position < size ? position : null, resultBudget)
+  return pageValue(cursors, scope, state, offset, candidates, position < size ? position : null, resultBudget)
 }
 
 /**
@@ -350,7 +454,14 @@ function readPage(
  * makes a line either fully reported or fully skipped regardless of where the
  * traversal resumed.
  */
-function scanText(root: Root, files: readonly FileFact[], query: string, start: SearchPosition, limit: number) {
+function scanText(
+  root: Root,
+  files: readonly FileFact[],
+  query: string,
+  start: SearchPosition,
+  limit: number,
+  failOnObservationChange: boolean,
+) {
   const queryBytes = Buffer.from(query, 'utf8')
   const failure = kmpFailure(queryBytes)
   const candidates: Array<Candidate<{ path: string; line: number; text: string }>> = []
@@ -373,6 +484,7 @@ function scanText(root: Root, files: readonly FileFact[], query: string, start: 
     try {
       open = openFileForRead(root, file.path)
     } catch {
+      if (failOnObservationChange) throw new ToolError('filesystem changed while reading')
       // The file was served by the walk and is gone now. The cursor this page
       // issues will fail on the next call, which is the report that matters.
       position = nextFile(position.file)
@@ -382,6 +494,7 @@ function scanText(root: Root, files: readonly FileFact[], query: string, start: 
     const { descriptor } = open
     const size = open.bytes
     try {
+      if (open.identity !== file.identity) throw new ToolError('filesystem changed while reading')
       if (position.offset > size || position.lineStart > position.offset) {
         throw new ToolError('cursor position is not valid')
       }
@@ -430,6 +543,7 @@ function scanText(root: Root, files: readonly FileFact[], query: string, start: 
         }
         position = nextFile(position.file)
       }
+      assertOpenFileIdentity(open)
     } finally {
       closeSync(descriptor)
     }
@@ -501,6 +615,7 @@ function validUtf8Prefix(bytes: Buffer): number {
 
 /** Pages a fully materialized, sorted candidate list. */
 function arrayPage<T>(
+  cursors: CursorCodec,
   scope: string,
   state: string,
   candidates: readonly Candidate<T>[],
@@ -511,6 +626,7 @@ function arrayPage<T>(
   if (offset > candidates.length) throw new ToolError('cursor position is not valid')
   const end = Math.min(offset + limit, candidates.length)
   return pageValue(
+    cursors,
     scope,
     state,
     offset,
@@ -525,6 +641,7 @@ function arrayPage<T>(
  * uses a fixed-length placeholder hash, then the chosen prefix is hashed once.
  */
 function pageValue<T>(
+  cursors: CursorCodec,
   scope: string,
   state: string,
   start: unknown,
@@ -536,7 +653,7 @@ function pageValue<T>(
     const next = count === candidates.length ? finalPosition : count === 0 ? start : candidates[count - 1]!.position
     return {
       items: candidates.slice(0, count).map((candidate) => candidate.item),
-      next_cursor: next === null ? null : encodeCursor(scope, state, next),
+      next_cursor: next === null ? null : cursors.encode(scope, state, next),
       content_hash: contentHash,
     }
   }

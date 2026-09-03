@@ -60,8 +60,13 @@ export function makeRoot(files) {
 }
 
 /** Spawns the server and returns a minimal JSON-RPC client over its stdio. */
-export function startServer(args) {
-  const child = spawn(process.execPath, [BINARY, ...args], { stdio: ['pipe', 'pipe', 'pipe'] })
+export function startServer(args, options = {}) {
+  const env = { ...process.env, ...options.env }
+  for (const name of options.unsetEnv ?? []) delete env[name]
+  const child = spawn(process.execPath, [BINARY, ...args], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
   const waiters = new Map()
   let stdout = ''
   let stderr = ''
