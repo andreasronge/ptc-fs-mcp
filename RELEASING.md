@@ -3,11 +3,11 @@
 Releases are published to npm by GitHub Actions. Do not publish from a local
 checkout.
 
-1. Update the version in `package.json` and `package-lock.json`, plus every
-   version-pinned example. Review the changes since the previous `v*` tag and
-   prepare brief release notes.
-2. Run `npm ci` and `npm run verify`. Commit the release preparation, merge it
-   into `main`, and confirm CI passes.
+1. Update the version in `package.json`, plus every version-pinned example.
+   Review the changes since the previous `v*` tag and prepare brief release
+   notes.
+2. Run `pnpm install --frozen-lockfile` and `pnpm run verify`. Commit the release
+   preparation, merge it into `main`, and confirm CI passes.
 3. Run the **Release** workflow manually on `main`. Manual runs are rehearsals:
    they verify npm authentication and provenance, then perform a dry-run
    publish.

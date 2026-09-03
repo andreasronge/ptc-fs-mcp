@@ -254,7 +254,7 @@ file, reads it back, and searches it — all in one process over the SDK's
 in-memory transport:
 
 ```console
-npm run build && node examples/embed.mjs
+pnpm run build && node examples/embed.mjs
 ```
 
 `openRoot` throws `ConfigError` on an unusable configuration, and tools raise
@@ -317,11 +317,16 @@ from userspace.
 ## Development
 
 ```console
-npm install
-npm run build        # tsc to dist/, with declarations and source maps
-npm test             # builds, then runs the suite against the built binary
-npm run verify       # format check, typecheck, and tests
+npm install --global corepack@latest # Node 25+ only; earlier releases bundle it
+corepack enable                    # once per machine
+pnpm install --frozen-lockfile
+pnpm run build                     # tsc to dist/, with declarations and source maps
+pnpm test                          # builds, then runs the suite against the built binary
+pnpm run verify                    # format check, typecheck, and tests
 ```
+
+The `packageManager` field in `package.json` pins pnpm and its integrity hash.
+Corepack verifies that hash, and automation reads the same field for the version.
 
 The suite drives the built `dist/cli.js` as a real child process over real
 stdio, so what ships is what is tested. Roots are generated per test rather
