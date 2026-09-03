@@ -47,16 +47,42 @@ is the one outcome worth spending an error on.
 Only the state a result actually depends on is bound, so a cursor is not
 invalidated by an unrelated change:
 
-| Tool             | Fails when                                      | Survives                                       |
-| ---------------- | ----------------------------------------------- | ---------------------------------------------- |
-| `list_directory` | The listed entries change                       | A file appears deeper in a listed subdirectory |
-| `search_files`   | The matching path set changes                   | A matched file's contents are edited           |
-| `search_text`    | Any in-scope file's contents or identity change | A change outside the searched prefix           |
-| `read_text_file` | That one file changes                           | Any other file changes                         |
+| Tool             | Fails when                                                               | Survives                                                                         |
+| ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `list_directory` | The listed entries change                                                | A file appears deeper in a listed subdirectory                                   |
+| `search_files`   | The matching path set changes                                            | A matched file's contents are edited                                             |
+| `search_text`    | Any in-scope content changes; by default, physical identity also changes | A change outside the prefix; deterministically, a checksum-identical replacement |
+| `read_text_file` | That file's content changes; by default, physical identity also changes  | Other files change; deterministically, a checksum-identical replacement          |
 
-Cursors are signed with a per-process key, bound to the tool and its arguments,
-and must be presented exactly as issued. A cursor from another traversal,
-another process, or an edited string is rejected.
+Cursors are opaque, signed, bound to the tool and its arguments, and must be
+presented exactly as issued. There are two modes:
+
+| Mode                     | Configuration             | Lifetime and state identity                                                                        |
+| ------------------------ | ------------------------- | -------------------------------------------------------------------------------------------------- |
+| Process-affine (default) | No cursor option          | A random signing key and physical file identity make cursors valid only in one process.            |
+| Deterministic (opt-in)   | `--cursor-key-env <name>` | A stable signing key and content digests let unchanged bytes resume across processes and machines. |
+
+Deterministic mode keeps `list_directory` and `search_files` path-only. It binds
+`read_text_file` to the selected file's size and SHA-256 digest, and
+`search_text` to the ordered paths, sizes, and digests in scope. Replacing a
+file with identical bytes therefore preserves a cursor; changing one served
+byte rejects it. Digests are cached by physical file identity within a process,
+up to the configured file-count limit. Files are hashed and read through opened
+descriptors with identity checks so a concurrent change fails rather than
+returning a torn page.
+
+The stable key is an integrity secret when clients are untrusted. A public key
+is useful for tests and trusted playback, but lets anyone holding it forge a
+cursor. Keep the named environment variable out of the MCP client's visible
+capability surface when cursor unforgeability matters.
+
+```json
+{
+  "args": ["--root", "workspace", "--include", "**", "--cursor-key-env", "PTC_FS_MCP_CURSOR_KEY"],
+  "inherit_environment": false,
+  "env": { "PTC_FS_MCP_CURSOR_KEY": "<base64url credential>" }
+}
+```
 
 **Every result carries `content_hash`,** the SHA-256 digest of the bytes that
 call returned. A citation then names the bytes actually read rather than a tree
@@ -73,15 +99,23 @@ only cover a bounded capture, and this server does not take one.
 ptc-fs-mcp --root ./workspace --include 'lib/**' --include 'docs/**' --exclude '**/secrets/**'
 ```
 
-| Option                   | Meaning                                                  |
-| ------------------------ | -------------------------------------------------------- |
-| `--root <dir>`           | Directory to confine to. Required.                       |
-| `--include <glob>`       | Serve matching paths. Required, repeatable.              |
-| `--exclude <glob>`       | Never serve matching paths. Repeatable; may only narrow. |
-| `--max-file-bytes <n>`   | Do not serve files larger than this.                     |
-| `--max-read-bytes <n>`   | Source bytes considered per read page. Default 16384.    |
-| `--max-result-bytes <n>` | Complete decoded tool result ceiling. Default 48000.     |
-| `--max-write-bytes <n>`  | Largest `write_text_file` payload. Default 65536.        |
+| Option                        | Meaning                                                            |
+| ----------------------------- | ------------------------------------------------------------------ |
+| `--root <dir>`                | Directory to confine to. Required.                                 |
+| `--include <glob>`            | Serve matching paths. Required, repeatable.                        |
+| `--exclude <glob>`            | Never serve matching paths. Repeatable; may only narrow.           |
+| `--max-file-bytes <n>`        | Do not serve files larger than this.                               |
+| `--max-read-bytes <n>`        | Source bytes considered per read page. Default 16384.              |
+| `--max-result-bytes <n>`      | Complete decoded tool result ceiling. Default 48000.               |
+| `--max-write-bytes <n>`       | Largest `write_text_file` payload. Default 65536.                  |
+| `--cursor-key-env <name>`     | Read a stable base64url cursor key from this environment variable. |
+| `--max-cursor-hash-bytes <n>` | File bytes hashed per deterministic call. Default 16777216.        |
+
+The cursor key must be canonical unpadded base64url encoding of at least 32
+bytes (256 bits). If the named variable is missing, empty, malformed, or too
+short, startup fails without printing its value. `--max-cursor-hash-bytes`
+bounds the total uncached content hashing required by one tool call; exceeding
+it fails with an actionable error instead of scanning an unbounded root.
 
 Read pages obey both byte budgets. `--max-read-bytes` bounds bytes from the
 source file, while `--max-result-bytes` bounds the complete decoded MCP tool
@@ -94,6 +128,19 @@ keeps one worst-case escaped 2048-byte internal text chunk representable.
 Set `--max-result-bytes` no higher than the consumer's effective decoded-result
 limit; consumers below 48000 bytes are unsupported. When the limit is unknown,
 keep the default.
+
+Library hosts opt in explicitly with a `createServer` option:
+
+```js
+const key = Buffer.from(process.env.PTC_FS_MCP_CURSOR_KEY, 'base64url')
+const server = createServer(root, {
+  cursorKey: key,
+  maxCursorHashBytes: 16_777_216,
+})
+```
+
+`cursorKey` must contain at least 32 bytes. Library hosts are responsible for
+decoding and protecting it; the server never reads an environment variable.
 
 For a consumer with a 1000000-byte decoded-result limit, a representative
 large-page configuration is:
@@ -171,10 +218,12 @@ node -p "require.resolve('ptc-fs-mcp/package.json').replace(/package\.json$/, 'd
 }
 ```
 
-The server itself needs nothing from the environment: it spawns no process,
-opens no network connection, and reads no variable of its own. `--root` is
-resolved against the working directory, so make it absolute as well unless the
-host sets a `cwd` you control. `hermetic_workspace` in
+By default the server needs nothing from the environment: it spawns no process
+and opens no network connection. Deterministic cursor mode reads only the
+variable explicitly named by `--cursor-key-env`; provide it through the host's
+`transport.env` credential binding even when inherited environment is disabled.
+`--root` is resolved against the working directory, so make it absolute unless
+the host sets a `cwd` you control. `hermetic_workspace` in
 [`examples/ptc-host.json`](examples/ptc-host.json) is this form.
 
 ### Splitting authority without splitting servers
@@ -256,11 +305,14 @@ directory, so an actor able to swap a parent directory mid-call is out of
 scope. The server rejects observed symlinks and uses a no-follow final open;
 it does not claim to defend an actively hostile source root.
 
-Cursor staleness is detected from size, mtime, ctime, and inode number. On a
-filesystem with coarse timestamp granularity, an in-place rewrite of exactly
-the same length within the same timestamp tick would not be detected. Every
-mainstream filesystem this runs on records nanosecond times, and ctime is not
-settable from userspace.
+In default mode, cursor staleness is detected from size, mtime, ctime, and inode
+number. Deterministic mode uses size and content digests for cursor state; the
+physical metadata only decides whether its bounded digest cache may be reused.
+On a filesystem with coarse timestamp granularity, an in-place rewrite of
+exactly the same length within the same timestamp tick could evade both the
+default state check and deterministic cache invalidation. Every mainstream
+filesystem this runs on records nanosecond times, and ctime is not settable
+from userspace.
 
 ## Development
 

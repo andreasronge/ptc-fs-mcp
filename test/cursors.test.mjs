@@ -15,6 +15,14 @@ import test from 'node:test'
 import { call, callFailing, respell, startServer, withFixture, withRoot } from './helpers/harness.mjs'
 
 const CHANGED = /the filesystem changed since this cursor was issued/
+const KEY = Buffer.alloc(32, 7).toString('base64url')
+const OTHER_KEY = Buffer.alloc(32, 8).toString('base64url')
+
+function deterministic(root, key = KEY, extra = []) {
+  return startServer(['--root', root, '--include', '**', '--cursor-key-env', 'TEST_CURSOR_KEY', ...extra], {
+    env: { TEST_CURSOR_KEY: key },
+  })
+}
 
 test('a read cursor is refused after the file it names is edited', async () => {
   const text = `${'a'.repeat(20_000)}\n`
@@ -190,6 +198,81 @@ test('cursors do not survive a server restart', async () => {
       assert.match(await callFailing(restarted, 'search_files', { query: '.txt', cursor }), /not valid/)
     } finally {
       await restarted.close()
+    }
+  })
+})
+
+test('deterministic cursors match and resume across independent processes for all paginated tools', async () => {
+  const files = {
+    'a.txt': `${'needle '.repeat(40_000)}\n`,
+    'b.txt': 'needle b\n',
+    'c.txt': 'quiet\n',
+  }
+  await withRoot(files, async (_server, root) => {
+    const first = deterministic(root)
+    const second = deterministic(root)
+    try {
+      for (const [name, args] of [
+        ['list_directory', { limit: 1 }],
+        ['search_files', { query: '.txt', limit: 1 }],
+        ['read_text_file', { path: 'a.txt', limit: 1 }],
+        ['search_text', { query: 'absent', limit: 1 }],
+      ]) {
+        const left = await call(first, name, args)
+        const right = await call(second, name, args)
+        assert.ok(left.next_cursor, `${name} must produce a cursor`)
+        assert.equal(left.next_cursor, right.next_cursor, `${name} cursor must be byte-identical`)
+        await call(second, name, { ...args, cursor: left.next_cursor })
+      }
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
+})
+
+test('a deterministic cursor survives checksum-identical replacement but rejects changed bytes', async () => {
+  const text = `${'same bytes '.repeat(3_000)}\n`
+  await withRoot({ 'big.txt': text }, async (_server, root) => {
+    const server = deterministic(root)
+    try {
+      const first = await call(server, 'read_text_file', { path: 'big.txt', limit: 1 })
+      rmSync(join(root, 'big.txt'))
+      writeFileSync(join(root, 'big.txt'), text)
+      await call(server, 'read_text_file', { path: 'big.txt', cursor: first.next_cursor })
+
+      writeFileSync(join(root, 'big.txt'), `${'changed '.repeat(3_000)}\n`)
+      assert.match(
+        await callFailing(server, 'read_text_file', { path: 'big.txt', cursor: first.next_cursor }),
+        CHANGED,
+      )
+    } finally {
+      await server.close()
+    }
+  })
+})
+
+test('deterministic cursors remain signed by the configured key', async () => {
+  await withRoot({ 'a.txt': 'a\n', 'b.txt': 'b\n' }, async (_server, root) => {
+    const first = deterministic(root)
+    const second = deterministic(root, OTHER_KEY)
+    try {
+      const cursor = (await call(first, 'search_files', { query: '.txt', limit: 1 })).next_cursor
+      assert.match(await callFailing(second, 'search_files', { query: '.txt', cursor }), /not valid/)
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
+})
+
+test('deterministic hashing fails at its configured work ceiling', async () => {
+  await withRoot({ 'large.txt': 'x'.repeat(100) }, async (_server, root) => {
+    const server = deterministic(root, KEY, ['--max-cursor-hash-bytes', '99'])
+    try {
+      assert.match(await callFailing(server, 'read_text_file', { path: 'large.txt' }), /hashing exceeds.*ceiling/)
+    } finally {
+      await server.close()
     }
   })
 })

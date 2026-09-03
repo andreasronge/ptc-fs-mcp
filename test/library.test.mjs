@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import vm from 'node:vm'
 import test from 'node:test'
 
 import { InMemoryTransport } from '@modelcontextprotocol/server'
@@ -32,8 +33,9 @@ const here = dirname(fileURLToPath(import.meta.url))
 const manifest = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
 
 /** Connects an in-process server and returns a one-shot request function. */
-async function connect(root, identity) {
-  const server = createServer(openRoot(root), identity)
+async function connect(root, identity, options) {
+  const opened = openRoot(root)
+  const server = identity === undefined ? createServer(opened, options) : createServer(opened, identity, options)
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair()
   await server.connect(serverSide)
   await clientSide.start()
@@ -78,6 +80,38 @@ async function connect(root, identity) {
     close: () => clientSide.close(),
   }
 }
+
+test('default cursors remain process-affine across embedded server instances', async () => {
+  const fixture = makeRoot({ 'a.txt': 'a\n', 'b.txt': 'b\n' })
+  const first = await connect({ root: fixture.root, include: ['**'] })
+  const second = await connect({ root: fixture.root, include: ['**'] })
+  try {
+    const page = await first.call('search_files', { query: '.txt', limit: 1 })
+    const resumed = await second.call('search_files', {
+      query: '.txt',
+      limit: 1,
+      cursor: page.result.structuredContent.next_cursor,
+    })
+    assert.equal(resumed.result?.isError, undefined)
+  } finally {
+    await first.close()
+    await second.close()
+    fixture.cleanup()
+  }
+})
+
+test('the library rejects short and non-byte cursor keys at runtime', () => {
+  const fixture = makeRoot({ 'a.txt': 'a\n' })
+  const root = openRoot({ root: fixture.root, include: ['**'] })
+  try {
+    for (const cursorKey of ['', new Uint8Array(31), new Uint32Array(8)]) {
+      assert.throws(() => createServer(root, { cursorKey }), ConfigError)
+    }
+    assert.doesNotThrow(() => createServer(root, { cursorKey: vm.runInNewContext('new Uint8Array(32)') }))
+  } finally {
+    fixture.cleanup()
+  }
+})
 
 test('an embedded server reads and writes over a transport of the caller\u2019s choosing', async () => {
   const fixture = makeRoot({ 'lib/alpha.ex': 'alpha line one\n' })

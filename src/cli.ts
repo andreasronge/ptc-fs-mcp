@@ -28,6 +28,12 @@ Options:
                           consumer's effective limit; consumers below 48000
                           bytes are unsupported.
   --max-write-bytes <n>   Largest write_text_file payload. Default 65536.
+  --cursor-key-env <name> Read a base64url HMAC key from this environment
+                          variable and enable deterministic cursors. The key
+                          must decode to at least 32 bytes.
+  --max-cursor-hash-bytes <n>
+                          File bytes hashed per call in deterministic mode.
+                          Default 16777216.
   --help                  Print this message.
   --version               Print the version.
 
@@ -40,11 +46,18 @@ The shebang resolves node through PATH. A host that spawns this without
 inheriting the environment must run an absolute node against an absolute
 dist/cli.js rather than this name or npx.`
 
-export function parseArguments(argv: readonly string[]): RootOptions {
+interface ParsedArguments extends RootOptions {
+  readonly cursorKeyEnv?: string
+  readonly maxCursorHashBytes?: number
+}
+
+export function parseArguments(argv: readonly string[]): ParsedArguments {
   const include: string[] = []
   const exclude: string[] = []
   const limits: { -readonly [K in keyof Limits]?: Limits[K] } = {}
   let root: string | undefined
+  let cursorKeyEnv: string | undefined
+  let maxCursorHashBytes: number | undefined
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]!
@@ -60,12 +73,37 @@ export function parseArguments(argv: readonly string[]): RootOptions {
     else if (flag === '--max-read-bytes') limits.maxReadBytes = positiveInteger(value, flag)
     else if (flag === '--max-result-bytes') limits.maxResultBytes = positiveInteger(value, flag)
     else if (flag === '--max-write-bytes') limits.maxWriteBytes = positiveInteger(value, flag)
+    else if (flag === '--cursor-key-env') {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value))
+        throw new ConfigError('--cursor-key-env must name an environment variable')
+      cursorKeyEnv = value
+    } else if (flag === '--max-cursor-hash-bytes') maxCursorHashBytes = positiveInteger(value, flag)
     else throw new ConfigError(`unknown option ${flag}`)
     index += 1
   }
 
   if (root === undefined) throw new ConfigError('--root is required')
-  return { root, include, exclude, limits }
+  return {
+    root,
+    include,
+    exclude,
+    limits,
+    ...(cursorKeyEnv === undefined ? {} : { cursorKeyEnv }),
+    ...(maxCursorHashBytes === undefined ? {} : { maxCursorHashBytes }),
+  }
+}
+
+function cursorKeyFromEnvironment(name: string | undefined): Buffer | undefined {
+  if (name === undefined) return undefined
+  const encoded = process.env[name]
+  if (encoded === undefined || encoded === '' || !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    throw new ConfigError('cursor key environment variable is missing, empty, or malformed')
+  }
+  const key = Buffer.from(encoded, 'base64url')
+  if (key.toString('base64url') !== encoded || key.byteLength < 32) {
+    throw new ConfigError('cursor key environment variable is malformed or contains fewer than 32 bytes')
+  }
+  return key
 }
 
 function positiveInteger(value: string, flag: string): number {
@@ -85,7 +123,9 @@ export function main(argv: readonly string[]): void {
     return
   }
 
-  const root = openRoot(parseArguments(argv))
+  const parsed = parseArguments(argv)
+  const root = openRoot(parsed)
+  const cursorKey = cursorKeyFromEnvironment(parsed.cursorKeyEnv)
   if (!root.selector.servesRootLevel) {
     // Not fatal: a read-only installation with `--include 'lib/**'` is a
     // legitimate and common setup, and this process cannot know which tools
@@ -97,12 +137,19 @@ export function main(argv: readonly string[]): void {
         'installation maps the write tool.\n',
     )
   }
-  const transport = serveStdio(() => createServer(root), {
-    // The plan's rule, enforced rather than merely documented: this server
-    // implements one profile, so a 2025-era opening is refused outright.
-    legacy: 'reject',
-    onerror: () => process.stderr.write('ptc-fs-mcp transport error\n'),
-  })
+  const transport = serveStdio(
+    () =>
+      createServer(root, IDENTITY, {
+        ...(cursorKey === undefined ? {} : { cursorKey }),
+        ...(parsed.maxCursorHashBytes === undefined ? {} : { maxCursorHashBytes: parsed.maxCursorHashBytes }),
+      }),
+    {
+      // The plan's rule, enforced rather than merely documented: this server
+      // implements one profile, so a 2025-era opening is refused outright.
+      legacy: 'reject',
+      onerror: () => process.stderr.write('ptc-fs-mcp transport error\n'),
+    },
+  )
 
   const shutdown = (): void => {
     void Promise.resolve()

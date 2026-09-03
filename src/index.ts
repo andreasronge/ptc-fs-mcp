@@ -16,7 +16,7 @@
 import { createRequire } from 'node:module'
 import type { McpServer } from '@modelcontextprotocol/server'
 
-import { createServer as build, type ServerIdentity } from './tools.js'
+import { createServer as build, type ServerIdentity, type ServerOptions } from './tools.js'
 import type { Root } from './root.js'
 
 const manifest = createRequire(import.meta.url)('../package.json') as { name: string; version: string }
@@ -30,8 +30,15 @@ export const IDENTITY: ServerIdentity = { name: 'ptc-fs-mcp', version: manifest.
  * The server is not connected to anything; give it a transport, or use
  * {@link serveStdio} from the SDK as the binary does.
  */
-export function createServer(root: Root, identity: ServerIdentity = IDENTITY): McpServer {
-  return build(root, identity)
+export function createServer(root: Root, options?: ServerOptions): McpServer
+export function createServer(root: Root, identity: ServerIdentity, options?: ServerOptions): McpServer
+export function createServer(
+  root: Root,
+  identityOrOptions: ServerIdentity | ServerOptions = IDENTITY,
+  options: ServerOptions = {},
+): McpServer {
+  const hasIdentity = 'name' in identityOrOptions && 'version' in identityOrOptions
+  return build(root, hasIdentity ? identityOrOptions : IDENTITY, hasIdentity ? options : identityOrOptions)
 }
 
 export { openRoot, DEFAULT_LIMITS } from './root.js'
@@ -39,4 +46,4 @@ export type { Root, RootOptions, Limits, FileFact } from './root.js'
 export { ConfigError, ToolError } from './errors.js'
 export { normalizeRelative, compileGlob, createSelector } from './paths.js'
 export type { Selector } from './paths.js'
-export type { ServerIdentity } from './tools.js'
+export type { ServerIdentity, ServerOptions } from './tools.js'

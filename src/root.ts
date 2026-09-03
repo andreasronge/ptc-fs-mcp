@@ -79,6 +79,16 @@ export interface OpenFile {
   readonly identity: string
 }
 
+/** Fails if an opened file changed since its original observation. */
+export function assertOpenFileIdentity(file: OpenFile, expected = file.identity): void {
+  try {
+    const stat = fstatSync(file.descriptor, { bigint: true })
+    if (!stat.isFile() || identityOf(stat) !== expected) throw new ToolError('filesystem changed while reading')
+  } catch (error) {
+    throw error instanceof ToolError ? error : new ToolError('filesystem changed while reading')
+  }
+}
+
 const WRITE_BASENAME = /^[a-z0-9][a-z0-9._-]{0,254}$/
 const NO_FOLLOW = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
 
