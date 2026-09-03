@@ -17,6 +17,7 @@
   },
   "license": "MIT",
   "author": "Andreas Ronge",
+  "packageManager": "pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e",
   "type": "module",
   "bin": {
     "ptc-fs-mcp": "dist/cli.js"
@@ -41,10 +42,10 @@
     "typecheck": "tsc --build --force",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "npm run build && node --test --test-reporter=spec test/*.test.mjs",
-    "test:coverage": "npm run build && node --test --experimental-test-coverage test/*.test.mjs",
-    "verify": "npm run format:check && npm run typecheck && npm test",
-    "prepublishOnly": "npm run clean && npm run verify"
+    "test": "pnpm run build && node --test --test-reporter=spec test/*.test.mjs",
+    "test:coverage": "pnpm run build && node --test --experimental-test-coverage test/*.test.mjs",
+    "verify": "pnpm run format:check && pnpm run typecheck && pnpm test",
+    "prepublishOnly": "pnpm run clean && pnpm run verify"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0"

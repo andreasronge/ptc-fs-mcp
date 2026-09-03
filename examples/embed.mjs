@@ -8,7 +8,7 @@
  *
  *   node examples/embed.mjs
  *
- * Run `npm run build` first, or install the package and import it by name.
+ * Run `pnpm run build` first, or install the package and import it by name.
  */
 
 import { mkdtempSync, rmSync } from 'node:fs'

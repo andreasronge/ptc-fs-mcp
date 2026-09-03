@@ -10,13 +10,14 @@ protocol behavior are deliberate security and compatibility boundaries.
 ## Setup and commands
 
 - Use a supported Node.js release from `package.json` (`>=20.19.0`) and install
-  the locked dependency tree with `npm ci`.
-- Run `npm run build` to compile `src/` into the ignored `dist/` directory.
-- Run `npm test` for the full integration suite. Tests exercise the built CLI
+  the locked dependency tree with `pnpm install --frozen-lockfile`. This
+  repository uses pnpm, with its exact version pinned in `package.json`.
+- Run `pnpm run build` to compile `src/` into the ignored `dist/` directory.
+- Run `pnpm test` for the full integration suite. Tests exercise the built CLI
   over real stdio and create their own temporary filesystem roots.
-- Run `npm run verify` before proposing a change. It checks formatting and
+- Run `pnpm run verify` before proposing a change. It checks formatting and
   types, rebuilds, and runs the full test suite.
-- Use `npm run format` when repository files need Prettier formatting.
+- Use `pnpm run format` when repository files need Prettier formatting.
 
 ## Repository conventions
 
