@@ -655,10 +655,25 @@ function isBinary(descriptor: number, length: number, atEnd: boolean): boolean {
   const tail = bytes.subarray(start)
   if (tail.length === 0 || !tail.includes(0)) return false
   // At end of file the tail is a whole line and answers the same rule as one.
-  // Short of that its bytes continue past the sniff, so the bar is higher:
-  // `validUtf8Prefix` tolerates a scalar cut short at the boundary, and zero
-  // means bytes that are invalid rather than merely clipped.
-  return atEnd ? validUtf8Prefix(tail) !== tail.length : validUtf8Prefix(tail) <= 0
+  const valid = validUtf8Prefix(tail)
+  if (atEnd) return valid !== tail.length
+  // Short of end of file the tail continues past the sniff, so invalidity
+  // within the last three bytes might only be a scalar the boundary cut in
+  // half. Might: a byte that can never begin a scalar is invalid outright, and
+  // reading it as truncation is what let an 8 KiB run of binary ending in one
+  // pass for text.
+  return valid <= 0 || (valid < tail.length && neverStartsScalar(tail[valid]!))
+}
+
+/**
+ * True when `byte` cannot be the first byte of any UTF-8 scalar.
+ *
+ * `0x80`-`0xC1` are continuation bytes or overlong leads, and `0xF5`-`0xFF`
+ * are beyond the highest code point, so neither can be the start of a
+ * sequence that simply has not arrived yet.
+ */
+function neverStartsScalar(byte: number): boolean {
+  return byte < 0xc2 ? byte >= 0x80 : byte > 0xf4
 }
 
 /**

@@ -378,3 +378,27 @@ test('--max-scan-bytes may not be set below two binary sniffs', async () => {
   assert.equal(code, 64)
   assert.match(server.stderr(), /limits are not valid/)
 })
+
+test('an invalid byte at the sniff boundary is not excused as truncation', async () => {
+  // The sniff reads exactly 8192 bytes. A run of binary whose last byte is
+  // 0xff used to read as "a scalar the boundary cut in half" and pass for
+  // text, because 0xff can never begin one it cannot be truncated.
+  const cut = Buffer.alloc(8_192, 0x41)
+  cut[10] = 0x00
+  cut[8_191] = 0xff
+  const binary = Buffer.concat([cut, Buffer.from('needle past the sniff\n')])
+
+  // A genuinely cut-short scalar at the same boundary must still be excused.
+  const truncated = Buffer.alloc(8_192, 0x41)
+  truncated[10] = 0x00
+  truncated[8_191] = 0xe2 // the first byte of a three-byte scalar
+  const text = Buffer.concat([truncated, Buffer.from([0x80, 0x94]), Buffer.from(' needle\n')])
+
+  await withRoot({ 'a-cut.bin': binary, 'b-trunc.txt': text }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
+      ['b-trunc.txt'],
+      'the intrinsically invalid file is skipped; the merely clipped one is scanned',
+    )
+  })
+})
