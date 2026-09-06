@@ -336,37 +336,49 @@ test('a listing charges the directories it walked through, as an inventory does'
   )
 })
 
-test('a listing spends its budget deterministically, not in readdir order', async () => {
-  // The probe stops at the first served file, so how much of the shared entry
-  // budget it spends depends on where that file falls. Sorting the directory
-  // first makes that position a property of the names, identical on every call
-  // and every filesystem, rather than of an enumeration order nothing
-  // promises. The served file sorting first is found at once; sorting last it
-  // is found only after the budget is gone -- and each stays that way.
+test('a probe charges every entry it reads, wherever the served file sits', async () => {
+  // The probe stops at the first served file, so charging as it probed made
+  // the budget depend on where that file landed -- and collecting the names
+  // first, to make that position deterministic, would have read an unbounded
+  // directory before any ceiling applied. Entries are charged as they are
+  // read, so the same directory costs the same whatever it holds.
   const build = (servedName) => ({
     [`dir/${servedName}.txt`]: 'x\n',
     ...Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`dir/skip${index}.md`, 'x\n'])),
   })
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (const servedName of ['aaa', 'zzz']) {
     await withRoot(
-      build('aaa'),
-      async (server) => {
-        const listed = await call(server, 'list_directory', { path: '' })
-        assert.deepEqual(
-          listed.items.map((entry) => entry.name),
-          ['dir'],
-        )
-      },
-      ['--include', '**/*.txt', '--max-entries', '6'],
-    )
-
-    await withRoot(
-      build('zzz'),
+      build(servedName),
       async (server) => {
         assert.match(await callFailing(server, 'list_directory', { path: '' }), /entry limit exceeded/)
       },
       ['--include', '**/*.txt', '--max-entries', '6'],
     )
   }
+})
+
+test('a listing is reproducible across identical calls', async () => {
+  const tree = {
+    'dir/served.txt': 'x\n',
+    ...Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`dir/skip${index}.md`, 'x\n'])),
+    'other/served.txt': 'x\n',
+  }
+
+  await withRoot(
+    tree,
+    async (server) => {
+      const first = await call(server, 'list_directory', { path: '' })
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const again = await call(server, 'list_directory', { path: '' })
+        assert.deepEqual(again.items, first.items)
+        assert.equal(again.content_hash, first.content_hash)
+      }
+      assert.deepEqual(
+        first.items.map((entry) => entry.name),
+        ['dir', 'other'],
+      )
+    },
+    ['--include', '**/*.txt'],
+  )
 })

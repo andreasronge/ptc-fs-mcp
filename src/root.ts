@@ -283,30 +283,33 @@ function servesAnything(
   counters.directories += 1
   if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
 
-  // Read the whole directory and sort it before probing. The probe stops at
-  // the first served file it finds, so in readdir order -- which no filesystem
-  // promises -- how much of the shared entry and directory budget it spends
-  // would depend on where that file happened to land, and the same tree could
-  // pass or fail a ceiling from one call to the next.
-  let names: string[]
+  let entries
   try {
-    const entries = opendirSync(directory)
-    try {
-      names = []
-      for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) names.push(entry.name)
-    } finally {
-      entries.closeSync()
-    }
+    entries = opendirSync(directory)
   } catch {
     return false
+  }
+
+  // Names are collected so the probe can run in a defined order: it stops at
+  // the first served file, and in readdir order -- which no filesystem
+  // promises -- which subdirectories it descended into first would decide how
+  // much of the shared budget it spent. Each entry is charged as it is read,
+  // not as it is probed, so collecting them is bounded by the same ceiling
+  // that bounds walking them.
+  const names: string[] = []
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      counters.entries += 1
+      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
+      names.push(entry.name)
+    }
+  } finally {
+    entries.closeSync()
   }
   names.sort()
 
   {
     for (const name of names) {
-      counters.entries += 1
-      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
-
       const path = posixJoin(prefix, name)
       if (normalizeRelative(path) !== path) continue
       if (root.selector.excludes(path)) continue
