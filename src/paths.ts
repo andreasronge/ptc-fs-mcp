@@ -39,8 +39,11 @@ export function posixJoin(prefix: string, name: string): string {
  * `*` matches within a segment, `**` crosses segments, and a trailing slash
  * after `**` additionally matches zero directories, so `lib/**` selects
  * `lib/a.ts` as well as `lib/deep/a.ts`. Every other character is literal.
+ *
+ * `flags` is passed to the compiled expression, so a caller that must match
+ * regardless of case can ask for it.
  */
-export function compileGlob(pattern: string): RegExp {
+export function compileGlob(pattern: string, flags = ''): RegExp {
   let source = '^'
   for (let index = 0; index < pattern.length; index += 1) {
     const character = pattern[index]!
@@ -60,7 +63,7 @@ export function compileGlob(pattern: string): RegExp {
     }
     source += character.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   }
-  return new RegExp(`${source}$`)
+  return new RegExp(`${source}$`, flags)
 }
 
 /**
@@ -170,9 +173,26 @@ export interface Selector {
   readonly servesRootLevel: boolean
 }
 
-export function createSelector(include: readonly string[], exclude: readonly string[]): Selector {
-  const included = include.map(compileGlob)
-  const excluded = exclude.map(compileGlob)
+/**
+ * Builds a selector from includes and two exclude sets.
+ *
+ * `caselessExclude` is matched without regard to case. That is for the
+ * built-in list: on a case-insensitive filesystem -- macOS and Windows by
+ * default -- `NODE_MODULES/pkg.js` and `.ENV` name the very same bytes as the
+ * excluded spelling, so a case-sensitive pattern is an alias away from being
+ * bypassed. Operator `--exclude` globs stay case-sensitive, because there a
+ * caller means the exact pattern they wrote.
+ */
+export function createSelector(
+  include: readonly string[],
+  exclude: readonly string[],
+  caselessExclude: readonly string[] = [],
+): Selector {
+  const included = include.map((pattern) => compileGlob(pattern))
+  const excluded = [
+    ...exclude.map((pattern) => compileGlob(pattern)),
+    ...caselessExclude.map((pattern) => compileGlob(pattern, 'i')),
+  ]
   const matches = (patterns: readonly RegExp[], path: string): boolean =>
     patterns.some((pattern) => pattern.test(path))
 

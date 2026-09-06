@@ -210,7 +210,11 @@ directories with `--exclude`.
 
 Every entry is an ordinary exclude glob, so the list can only narrow what
 `--include` selected, and an excluded directory is skipped without descending
-into it. That is a cost question as much as a tidiness one: a scan budget spent
+into it. The built-in patterns are matched without regard to case, because on
+a case-insensitive filesystem `NODE_MODULES/pkg.js` names the very same bytes
+as the excluded spelling and a case-sensitive pattern would be one alias away
+from being bypassed. An explicit `--exclude` stays case-sensitive: there a
+caller means the exact pattern they wrote. That is a cost question as much as a tidiness one: a scan budget spent
 walking `deps` is a page of empty results while the match a caller wanted waits
 behind it.
 
@@ -241,10 +245,13 @@ reason -- splitting on a bare pipe would quietly change the meaning of every
 search for text that contains one, and `string | number` is ordinary source.
 A cursor is bound to the exact terms and folding it was issued for.
 
-`search_text` skips a file whose opening bytes contain a NUL. Every line in a
-binary file would fail to decode and be dropped anyway, so scanning one can
-only spend the page budget proving that. Listings stay content-blind, and
-`read_text_file` still refuses the same file with `file is not valid UTF-8`.
+`search_text` skips a file whole when its opening bytes both contain a NUL and
+fail to decode as UTF-8. Either signal alone discards real text: NUL is itself
+valid UTF-8, and a text file holding one malformed line is meant to lose that
+line rather than the file. Together they identify the compiled artifacts and
+dumps whose every line would be dropped anyway. Listings stay content-blind,
+and `read_text_file` still refuses the same file with `file is not valid
+UTF-8`.
 
 ### Serving a large root
 
@@ -414,7 +421,10 @@ Tasks.
   still carry a dot segment and are still rejected.
 - Symbolic links are skipped, never followed, so a link inside the root cannot
   reach bytes outside it. The final `open` uses `O_NOFOLLOW`, so a link swapped
-  in after the check still fails.
+  in after the check still fails. `O_NOFOLLOW` covers only the name it opens,
+  so every ancestor of a path is checked before that open too: naming
+  `link/secret.txt`, or listing `link` as a prefix, is refused rather than
+  followed.
 - A directory appears in a listing only because it holds something served, so
   an unserved directory's name never leaks.
 - `write_text_file` accepts one lowercase basename — no directories, no

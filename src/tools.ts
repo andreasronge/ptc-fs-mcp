@@ -527,13 +527,16 @@ function scanText(
       if (position.offset > size || position.lineStart > position.offset) {
         throw new ToolError('cursor position is not valid')
       }
-      // A NUL in the opening bytes means the file is binary, so every line it
-      // holds would fail to decode and be dropped anyway. Skipping it whole
-      // turns a compiled artifact or a PDF from a hundred empty pages into
-      // one sniffed buffer. The sniff is charged to the scan budget so a root
-      // full of binaries still makes bounded progress per call, and it reads
-      // the same bytes the scan would have read first, so it costs nothing on
-      // a file that is text.
+      // A file is skipped whole only when both binary signals agree: its
+      // opening bytes hold a NUL and they do not decode as UTF-8. Either test
+      // alone drops real text. NUL is itself valid UTF-8, so the usual NUL
+      // heuristic would have silently discarded 34 MB of genuine text on one
+      // real checkout; and undecodability alone would discard a text file
+      // holding a single malformed line, which `evidence` is supposed to skip
+      // one line at a time. Together they still skip the compiled artifacts
+      // and dumps that made searching a real root cost a hundred empty pages.
+      // The sniff is charged to the scan budget, and on a file that is text it
+      // reads the same bytes the scan would have read first.
       if (position.offset === 0 && isBinary(descriptor, size)) {
         scanned += Math.min(BINARY_SNIFF_BYTES, size)
         position = nextFile(position.file)
@@ -602,13 +605,15 @@ function nextFile(file: number): SearchPosition {
   return { file: file + 1, offset: 0, lineStart: 0, line: 1, matched: false }
 }
 
-/** True when the opening bytes hold a NUL, the standard mark of a binary file. */
+/** True when the opening bytes both hold a NUL and fail to decode as UTF-8. */
 function isBinary(descriptor: number, size: number): boolean {
   const length = Math.min(BINARY_SNIFF_BYTES, size)
   if (length === 0) return false
   const bytes = Buffer.allocUnsafe(length)
   if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
-  return bytes.includes(0)
+  // `validUtf8Prefix` allows a sniff that stops mid-scalar, so a cut-short
+  // multi-byte character at the 8 KiB boundary is not mistaken for evidence.
+  return bytes.includes(0) && validUtf8Prefix(bytes) <= 0
 }
 
 /**
@@ -884,7 +889,7 @@ function byteOfLine(descriptor: number, size: number, line: number, budget: numb
 
   while (position < size) {
     if (position >= budget) throw new ToolError('start_line is further into the file than one page may scan')
-    const wanted = Math.min(buffer.length, size - position)
+    const wanted = Math.min(buffer.length, size - position, budget - position)
     const count = readSync(descriptor, buffer, 0, wanted, position)
     if (count <= 0) throw new ToolError('read failed')
 

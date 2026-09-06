@@ -23,9 +23,10 @@ Options:
   --exclude <glob>        Never serve paths matching this glob. Repeatable.
                           May only narrow what --include selected.
   --no-default-exclude    Do not apply the built-in excludes. Those cover
-                          dependency and build directories such as
-                          node_modules, dist, and .git, plus credential
-                          filenames such as .env and *.pem. They only ever
+                          dependency and tool directories such as
+                          node_modules, _build, deps, and .git, plus
+                          credential filenames such as .env and *.pem. They
+                          are matched without regard to case, only ever
                           narrow, and this flag drops all of them at once.
   --max-files <n>         Most files one traversal may select. Default 50000.
   --max-directories <n>   Most directories one traversal may enter.
@@ -137,7 +138,7 @@ function cursorKeyFromEnvironment(name: string | undefined): Buffer | undefined 
 
 /** Literal include patterns -- no wildcards -- that a built-in exclude covers. */
 function literalIncludesDefeatedByDefaults(include: readonly string[]): string[] {
-  const defaults = DEFAULT_EXCLUDE.map(compileGlob)
+  const defaults = DEFAULT_EXCLUDE.map((pattern) => compileGlob(pattern, 'i'))
   return include.filter((pattern) => !/[*?]/.test(pattern) && defaults.some((excluded) => excluded.test(pattern)))
 }
 

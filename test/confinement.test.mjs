@@ -151,3 +151,37 @@ test('the fixture is unchanged by a full read-only session', async () => {
     assert.equal(alpha.map((chunk) => chunk.text).join(''), FIXTURE['lib/alpha.ex'])
   })
 })
+
+test('a symlinked directory cannot be listed by naming it as a prefix', async () => {
+  // The walk skips symlinks as it descends, but a prefix names a directory to
+  // open directly, so every component of it is checked before that open.
+  await withRoot({ 'real/keep.txt': 'served\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    const listed = await call(server, 'list_directory', { path: 'link' })
+    assert.deepEqual(listed.items, [], 'a link must not become a window out of the root')
+
+    const top = await call(server, 'list_directory', { path: '' })
+    assert.deepEqual(
+      top.items.map((entry) => entry.name),
+      ['real'],
+      'and the link itself is not listed either',
+    )
+  })
+})
+
+test('a symlinked ancestor cannot be read through', async () => {
+  // O_NOFOLLOW guards the name it opens, so an intermediate link would
+  // otherwise be followed by the kernel before that flag ever applied.
+  await withRoot({ 'real/keep.txt': 'served\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    assert.match(
+      await callFailing(server, 'read_text_file', { path: 'link/anything.txt' }),
+      /not served by this root/,
+    )
+  })
+})
+
+test('a search scoped to a symlinked prefix finds nothing', async () => {
+  await withRoot({ 'real/keep.txt': 'needle\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    const page = await call(server, 'search_text', { query: 'needle', path: 'link' })
+    assert.deepEqual(page.items, [])
+  })
+})

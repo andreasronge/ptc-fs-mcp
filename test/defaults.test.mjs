@@ -230,3 +230,46 @@ test('the walk ceilings are configurable and still refuse what they must', async
     ['--include', '**', '--max-depth', '1'],
   )
 })
+
+test('the built-in excludes match without regard to case', async () => {
+  // On a case-insensitive filesystem `NODE_MODULES/pkg.js` and
+  // `node_modules/pkg.js` name the same bytes, so a case-sensitive default
+  // would be one alias away from being bypassed.
+  await withRoot(
+    { 'NODE_MODULES/pkg.js': 'leaked\n', '.ENV': 'TOKEN=leaked\n', 'app.js': 'kept\n' },
+    async (server) => {
+      assert.deepEqual(await collect(server, 'search_files', { any_of: ['pkg', 'ENV'] }), [])
+      assert.match(await callFailing(server, 'read_text_file', { path: 'NODE_MODULES/pkg.js' }), /not served/)
+      assert.deepEqual(
+        (await collect(server, 'search_text', { query: 'kept' })).map((match) => match.path),
+        ['app.js'],
+      )
+    },
+  )
+})
+
+test('an operator --exclude stays case-sensitive', async () => {
+  // The built-in list is caseless because it names tool output nobody chose.
+  // An explicit pattern means the exact spelling the operator wrote.
+  await withRoot(
+    { 'Build/x.txt': 'kept\n' },
+    async (server) => {
+      assert.deepEqual(
+        (await collect(server, 'search_text', { query: 'kept' })).map((match) => match.path),
+        ['Build/x.txt'],
+      )
+    },
+    ['--include', '**', '--exclude', 'build/**'],
+  )
+})
+
+test('the depth ceiling is measured from the root, not from the listed directory', async () => {
+  await withRoot(
+    { 'a/b/c/d.txt': 'x\n' },
+    async (server) => {
+      assert.match(await callFailing(server, 'list_directory', { path: 'a/b' }), /directory depth limit exceeded/)
+      assert.match(await callFailing(server, 'search_files', { query: 'd' }), /directory depth limit exceeded/)
+    },
+    ['--include', '**', '--max-depth', '1'],
+  )
+})

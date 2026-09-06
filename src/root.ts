@@ -126,8 +126,32 @@ export function openRoot(options: RootOptions): Root {
   if (stat.isSymbolicLink()) throw new ConfigError('root must not be a symbolic link')
   if (!stat.isDirectory()) throw new ConfigError('root is not a directory')
 
-  const exclude = [...(options.defaultExclude === false ? [] : DEFAULT_EXCLUDE), ...(options.exclude ?? [])]
-  return { absolute, selector: createSelector(options.include, exclude), limits }
+  const caseless = options.defaultExclude === false ? [] : DEFAULT_EXCLUDE
+  return { absolute, selector: createSelector(options.include, options.exclude ?? [], caseless), limits }
+}
+
+/**
+ * The absolute path of a relative directory `prefix`, or null when any
+ * component of it is missing, is not a directory, or is a symbolic link.
+ *
+ * `O_NOFOLLOW` protects only the component it opens, so an intermediate link
+ * -- `link/creds.txt` where `link` points outside the root -- is followed by
+ * the kernel before that flag ever applies. Every ancestor is therefore
+ * lstat-ed here before anything opens the result. This is the same guarantee
+ * the walk gets for free by descending one directory at a time, and it carries
+ * the same caveat the README already states: a privileged actor able to swap a
+ * parent directory between this check and the open is out of scope.
+ */
+export function resolveDirectory(root: Root, prefix: string): string | null {
+  let absolute = root.absolute
+  if (prefix === '') return absolute
+
+  for (const segment of prefix.split('/')) {
+    absolute = join(absolute, segment)
+    const stat = lstatSync(absolute, { throwIfNoEntry: false })
+    if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return null
+  }
+  return absolute
 }
 
 /**
@@ -144,9 +168,17 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
   const counters = { directories: 0, entries: 0 }
   const listed: Array<{ name: string; kind: string; path: string }> = []
 
+  // Depth is measured from the root, not from the listed directory, so naming
+  // a deep prefix cannot buy traversal the ceiling would otherwise refuse.
+  const depth = prefix === '' ? 0 : prefix.split('/').length
+  if (depth > root.limits.maxDepth) throw new ToolError('directory depth limit exceeded')
+
+  const directory = resolveDirectory(root, prefix)
+  if (directory === null) return []
+
   let entries
   try {
-    entries = opendirSync(prefix === '' ? root.absolute : join(root.absolute, prefix))
+    entries = opendirSync(directory)
   } catch {
     // No such directory, or not a directory at all. An empty listing is the
     // same answer a full inventory gave, and it discloses nothing either way.
@@ -167,7 +199,7 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
       if (!stat || stat.isSymbolicLink()) continue
 
       if (stat.isDirectory()) {
-        if (servesAnything(root, absolute, path, 1, counters)) {
+        if (servesAnything(root, absolute, path, depth + 1, counters)) {
           listed.push({ name: entry.name, kind: 'directory', path })
         }
         continue
@@ -313,6 +345,13 @@ function identityOf(stat: { size: bigint; mtimeNs: bigint; ctimeNs: bigint; ino:
  * the final component even if it appeared after the walk observed the path.
  */
 export function openFileForRead(root: Root, path: string): OpenFile {
+  // The parent chain is checked before the descriptor is opened, for the same
+  // reason resolveDirectory exists: O_NOFOLLOW below guards the final name
+  // only, so a symlinked ancestor would otherwise be followed by the kernel.
+  const separator = path.lastIndexOf('/')
+  if (separator !== -1 && resolveDirectory(root, path.slice(0, separator)) === null) {
+    throw new ToolError('path is not served by this root')
+  }
   if (!root.selector.selects(path)) throw new ToolError('path is not served by this root')
 
   let descriptor: number

@@ -234,14 +234,29 @@ test('a cursor is bound to the terms and the folding it was issued for', async (
 })
 
 test('search_text skips a binary file whole rather than scanning it', async () => {
-  const binary = Buffer.concat([Buffer.from('needle'), Buffer.from([0x00]), Buffer.alloc(200_000, 0x41)])
+  // Both signals: a NUL, and bytes that do not decode as UTF-8.
+  const binary = Buffer.concat([Buffer.from([0x00, 0xff, 0xfe, 0x00]), Buffer.alloc(200_000, 0xc0)])
 
   await withRoot({ 'blob.bin': binary, 'notes.txt': 'needle in text\n' }, async (server) => {
     assert.deepEqual(
       (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
       ['notes.txt'],
-      'a NUL in the opening bytes means every line would fail to decode anyway',
     )
+  })
+})
+
+test('a file is skipped only when both binary signals agree', async () => {
+  // NUL is valid UTF-8, so a NUL alone must not discard a text file...
+  const withNul = `first line\nsecond\0line has a nul\nneedle here\n`
+  // ...and one malformed line must not discard the rest either, which is the
+  // behaviour `evidence` already promises line by line.
+  const withBadByte = Buffer.concat([Buffer.from('needle up top\n'), Buffer.from([0xff, 0xfe, 0x0a])])
+
+  await withRoot({ 'a.txt': withNul, 'b.txt': withBadByte }, async (server) => {
+    assert.deepEqual((await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path).sort(), [
+      'a.txt',
+      'b.txt',
+    ])
   })
 })
 
