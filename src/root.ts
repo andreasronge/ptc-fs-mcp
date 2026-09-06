@@ -7,7 +7,18 @@
  * `open` uses `O_NOFOLLOW` so a link swapped in after the check still fails.
  */
 
-import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, opendirSync, openSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  opendirSync,
+  openSync,
+  writeSync,
+  type BigIntStats,
+  type Stats,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { ConfigError, ToolError } from './errors.js'
@@ -152,6 +163,27 @@ export function openRoot(options: RootOptions): Root {
  * the same caveat the README already states: a privileged actor able to swap a
  * parent directory between this check and the open is out of scope.
  */
+/**
+ * `lstat`, or null for any reason it could not be taken.
+ *
+ * `throwIfNoEntry: false` suppresses only ENOENT; ENAMETOOLONG on an
+ * over-long component, or EACCES on an unreadable ancestor, still throw -- and
+ * the message Node builds carries the absolute host path, which no error
+ * leaving this server may contain. Every such failure means the same thing
+ * here anyway: the path is not one this root serves.
+ */
+function lstatOrNull(absolute: string, bigint: false): Stats | null
+function lstatOrNull(absolute: string, bigint: true): BigIntStats | null
+function lstatOrNull(absolute: string, bigint: boolean): Stats | BigIntStats | null {
+  try {
+    return bigint
+      ? (lstatSync(absolute, { throwIfNoEntry: false, bigint: true }) ?? null)
+      : (lstatSync(absolute, { throwIfNoEntry: false }) ?? null)
+  } catch {
+    return null
+  }
+}
+
 export function resolveDirectory(root: Root, prefix: string): string | null {
   let absolute = root.absolute
   if (prefix === '') return absolute
@@ -159,7 +191,7 @@ export function resolveDirectory(root: Root, prefix: string): string | null {
 
   for (const segment of prefix.split('/')) {
     absolute = join(absolute, segment)
-    const stat = lstatSync(absolute, { throwIfNoEntry: false })
+    const stat = lstatOrNull(absolute, false)
     if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return null
   }
   return absolute
@@ -211,7 +243,7 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
       if (root.selector.excludes(path)) continue
 
       const absolute = join(entries.path, entry.name)
-      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      const stat = lstatOrNull(absolute, true)
       if (!stat || stat.isSymbolicLink()) continue
 
       if (stat.isDirectory()) {
@@ -265,7 +297,7 @@ function servesAnything(
       if (root.selector.excludes(path)) continue
 
       const absolute = join(directory, entry.name)
-      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      const stat = lstatOrNull(absolute, true)
       if (!stat || stat.isSymbolicLink()) continue
 
       if (stat.isDirectory()) {
@@ -331,7 +363,7 @@ function walk(
       if (root.selector.excludes(path)) continue
 
       const absolute = join(directory, entry.name)
-      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      const stat = lstatOrNull(absolute, true)
       if (!stat || stat.isSymbolicLink()) continue
 
       if (stat.isDirectory()) {

@@ -255,7 +255,8 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
       title: 'Read text file',
       description:
         'Bounded exact UTF-8 chunks of live bytes. Concatenate item text and follow next_cursor. Pass start_line ' +
-        'to begin at a 1-based line instead of the start of the file.',
+        'to begin at a 1-based line instead of the start of the file; only the bytes actually returned must ' +
+        'decode as UTF-8.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(

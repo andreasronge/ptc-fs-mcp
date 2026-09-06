@@ -297,6 +297,12 @@ the result budget first. `byte_offset` stays absolute, so a line-addressed read
 is still citable against the whole file, and a cursor is bound to the
 `start_line` it was issued for.
 
+Only the bytes actually returned have to decode. Seeking to a line counts
+newlines and reads nothing out, so a file whose earlier lines are not valid
+UTF-8 can still be read from a later one -- which is the useful answer for a
+CSV whose header was written in some other encoding. Reading that same file
+from the beginning still fails, because then those bytes would be served.
+
 There is no line index to seek with, so locating a line counts newlines from
 the start. That happens only on the page with no cursor to resume from -- every
 later page reads its offset out of the cursor -- and it is charged against

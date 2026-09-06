@@ -106,3 +106,17 @@ test('the start_line scan cannot read past its budget in a single buffer', async
     ['--include', '**', '--max-scan-bytes', '16384'],
   )
 })
+
+test('only the bytes actually returned have to decode as UTF-8', async () => {
+  // Seeking reads nothing out, so a bad earlier line does not condemn a later
+  // one. Reading the same file from the start still fails, because then those
+  // bytes would be served.
+  const file = Buffer.concat([Buffer.from([0xff, 0xfe, 0x0a]), Buffer.from('good line\n')])
+
+  await withRoot({ 'mixed.csv': file }, async (server) => {
+    assert.match(await callFailing(server, 'read_text_file', { path: 'mixed.csv' }), /not valid UTF-8/)
+
+    const page = await call(server, 'read_text_file', { path: 'mixed.csv', start_line: 2 })
+    assert.equal(page.items[0].text, 'good line\n')
+  })
+})

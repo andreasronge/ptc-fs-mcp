@@ -218,3 +218,19 @@ test('an exclude deep in the tree still covers everything under it', async () =>
     ['--include', '**', '--exclude', 'a/b/hide'],
   )
 })
+
+test('a filesystem error on a path component never carries the host path', async () => {
+  // `throwIfNoEntry: false` suppresses only ENOENT; an over-long component
+  // still throws, and the message Node builds names the absolute path.
+  const overLong = 'n'.repeat(300)
+
+  await withRoot({ 'a.txt': 'x\n' }, async (server) => {
+    // A component that cannot be stat-ed is a directory this root does not
+    // serve, which reads the same as one that is not there.
+    assert.deepEqual((await call(server, 'list_directory', { path: overLong })).items, [])
+
+    const message = await callFailing(server, 'read_text_file', { path: `${overLong}/f.txt` })
+    assert.match(message, /not served by this root/)
+    assert.doesNotMatch(message, /ENAMETOOLONG|lstat|\/private\/|\/tmp\//)
+  })
+})
