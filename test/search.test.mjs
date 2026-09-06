@@ -402,3 +402,20 @@ test('an invalid byte at the sniff boundary is not excused as truncation', async
     )
   })
 })
+
+test('a lead byte that never delivers its scalar is not excused either', async () => {
+  // 0xC2 announces a two-byte scalar; the 'A' after it proves the sequence
+  // malformed rather than merely cut short by the sniff boundary.
+  const malformed = Buffer.alloc(8_192, 0x41)
+  malformed[10] = 0x00
+  malformed[8_190] = 0xc2
+  malformed[8_191] = 0x41
+  const binary = Buffer.concat([malformed, Buffer.from('needle past the sniff\n')])
+
+  await withRoot({ 'a.bin': binary, 'b.txt': 'needle in text\n' }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
+      ['b.txt'],
+    )
+  })
+})

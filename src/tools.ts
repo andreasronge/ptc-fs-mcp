@@ -657,23 +657,34 @@ function isBinary(descriptor: number, length: number, atEnd: boolean): boolean {
   // At end of file the tail is a whole line and answers the same rule as one.
   const valid = validUtf8Prefix(tail)
   if (atEnd) return valid !== tail.length
-  // Short of end of file the tail continues past the sniff, so invalidity
-  // within the last three bytes might only be a scalar the boundary cut in
-  // half. Might: a byte that can never begin a scalar is invalid outright, and
-  // reading it as truncation is what let an 8 KiB run of binary ending in one
-  // pass for text.
-  return valid <= 0 || (valid < tail.length && neverStartsScalar(tail[valid]!))
+  // Short of end of file the tail continues past the sniff, so invalidity in
+  // its last bytes might only be a scalar the boundary cut in half. Might:
+  // those bytes are excused only when they are genuinely the beginning of one
+  // and nothing more.
+  return valid <= 0 || !isIncompleteScalar(tail.subarray(valid))
 }
 
 /**
- * True when `byte` cannot be the first byte of any UTF-8 scalar.
+ * True when `suffix` is the start of a UTF-8 scalar and nothing else -- a
+ * sequence the sniff boundary could have cut in half.
  *
- * `0x80`-`0xC1` are continuation bytes or overlong leads, and `0xF5`-`0xFF`
- * are beyond the highest code point, so neither can be the start of a
- * sequence that simply has not arrived yet.
+ * Both halves matter. A lead byte alone is not enough: `0xC2` followed by `A`
+ * announces a two-byte scalar and then fails to deliver one, which is malformed
+ * however many bytes follow. And the sequence must still be short of its own
+ * length, or it is complete and its invalidity is its own.
  */
-function neverStartsScalar(byte: number): boolean {
-  return byte < 0xc2 ? byte >= 0x80 : byte > 0xf4
+function isIncompleteScalar(suffix: Buffer): boolean {
+  const lead = suffix[0]
+  if (lead === undefined) return false
+
+  const expected = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc2 ? 2 : 0
+  if (expected === 0 || lead > 0xf4 || suffix.length >= expected) return false
+
+  for (let index = 1; index < suffix.length; index += 1) {
+    const byte = suffix[index]!
+    if (byte < 0x80 || byte > 0xbf) return false
+  }
+  return true
 }
 
 /**

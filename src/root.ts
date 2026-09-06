@@ -283,23 +283,35 @@ function servesAnything(
   counters.directories += 1
   if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
 
-  let entries
+  // Read the whole directory and sort it before probing. The probe stops at
+  // the first served file it finds, so in readdir order -- which no filesystem
+  // promises -- how much of the shared entry and directory budget it spends
+  // would depend on where that file happened to land, and the same tree could
+  // pass or fail a ceiling from one call to the next.
+  let names: string[]
   try {
-    entries = opendirSync(directory)
+    const entries = opendirSync(directory)
+    try {
+      names = []
+      for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) names.push(entry.name)
+    } finally {
+      entries.closeSync()
+    }
   } catch {
     return false
   }
+  names.sort()
 
-  try {
-    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+  {
+    for (const name of names) {
       counters.entries += 1
       if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
 
-      const path = posixJoin(prefix, entry.name)
+      const path = posixJoin(prefix, name)
       if (normalizeRelative(path) !== path) continue
       if (root.selector.excludes(path)) continue
 
-      const absolute = join(directory, entry.name)
+      const absolute = join(directory, name)
       const stat = lstatOrNull(absolute, true)
       if (!stat || stat.isSymbolicLink()) continue
 
@@ -312,8 +324,6 @@ function servesAnything(
       if (Number(stat.size) > root.limits.maxFileBytes) continue
       return true
     }
-  } finally {
-    entries.closeSync()
   }
 
   return false

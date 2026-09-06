@@ -335,3 +335,38 @@ test('a listing charges the directories it walked through, as an inventory does'
     ['--include', '**', '--max-directories', '2'],
   )
 })
+
+test('a listing spends its budget deterministically, not in readdir order', async () => {
+  // The probe stops at the first served file, so how much of the shared entry
+  // budget it spends depends on where that file falls. Sorting the directory
+  // first makes that position a property of the names, identical on every call
+  // and every filesystem, rather than of an enumeration order nothing
+  // promises. The served file sorting first is found at once; sorting last it
+  // is found only after the budget is gone -- and each stays that way.
+  const build = (servedName) => ({
+    [`dir/${servedName}.txt`]: 'x\n',
+    ...Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`dir/skip${index}.md`, 'x\n'])),
+  })
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await withRoot(
+      build('aaa'),
+      async (server) => {
+        const listed = await call(server, 'list_directory', { path: '' })
+        assert.deepEqual(
+          listed.items.map((entry) => entry.name),
+          ['dir'],
+        )
+      },
+      ['--include', '**/*.txt', '--max-entries', '6'],
+    )
+
+    await withRoot(
+      build('zzz'),
+      async (server) => {
+        assert.match(await callFailing(server, 'list_directory', { path: '' }), /entry limit exceeded/)
+      },
+      ['--include', '**/*.txt', '--max-entries', '6'],
+    )
+  }
+})
