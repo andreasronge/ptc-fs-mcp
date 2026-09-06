@@ -271,3 +271,25 @@ test('a selector reports whether any include can reach the root itself', () => {
     assert.equal(createSelector(include, []).servesRootLevel, reachable, include.join(' '))
   }
 })
+
+test('the package exports the path contract, not the raw traversal helpers', async () => {
+  // `inventory` and `directoryListing` join their argument onto the root and
+  // open the result; the tools normalize before calling them. Exporting them
+  // would publish that obligation to every caller, so they stay internal.
+  const api = await import('../dist/index.js')
+  assert.deepEqual(
+    Object.keys(api).sort(),
+    [
+      'ConfigError',
+      'DEFAULT_EXCLUDE',
+      'DEFAULT_LIMITS',
+      'IDENTITY',
+      'ToolError',
+      'compileGlob',
+      'createSelector',
+      'createServer',
+      'normalizeRelative',
+      'openRoot',
+    ].sort(),
+  )
+})

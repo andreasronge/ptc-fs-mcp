@@ -187,6 +187,9 @@ function lstatOrNull(absolute: string, bigint: boolean): Stats | BigIntStats | n
 export function resolveDirectory(root: Root, prefix: string): string | null {
   let absolute = root.absolute
   if (prefix === '') return absolute
+  // Every caller normalizes first, but this function joins segments onto the
+  // root and opens the result, so it does not take that on trust.
+  if (normalizeRelative(prefix) !== prefix) return null
   if (root.selector.excludesAncestor(prefix)) return null
 
   for (const segment of prefix.split('/')) {
