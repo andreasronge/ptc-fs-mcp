@@ -272,3 +272,20 @@ test('a binary file is still listed and still refuses to be read as text', async
     assert.match(await callFailing(server, 'read_text_file', { path: 'blob.bin' }), /not valid UTF-8/)
   })
 })
+
+test('the binary sniff obeys the scan budget rather than reading past it', async () => {
+  const binary = Buffer.concat([Buffer.from([0x00, 0xff, 0xfe, 0x00]), Buffer.alloc(50_000, 0xc0)])
+
+  await withRoot(
+    { 'blob.bin': binary, 'notes.txt': 'needle in text\n' },
+    async (server) => {
+      const matches = await collect(server, 'search_text', { query: 'needle' })
+      assert.deepEqual(
+        matches.map((match) => match.path),
+        ['notes.txt'],
+        'a clamped sniff must still classify, and the traversal must still finish',
+      )
+    },
+    ['--include', '**', '--max-scan-bytes', '4096'],
+  )
+})

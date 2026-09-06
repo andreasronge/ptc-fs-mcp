@@ -537,8 +537,9 @@ function scanText(
       // and dumps that made searching a real root cost a hundred empty pages.
       // The sniff is charged to the scan budget, and on a file that is text it
       // reads the same bytes the scan would have read first.
-      if (position.offset === 0 && isBinary(descriptor, size)) {
-        scanned += Math.min(BINARY_SNIFF_BYTES, size)
+      const sniff = Math.min(BINARY_SNIFF_BYTES, size, scanBudget - scanned)
+      if (position.offset === 0 && sniff > 0 && isBinary(descriptor, sniff)) {
+        scanned += sniff
         position = nextFile(position.file)
         continue
       }
@@ -605,10 +606,14 @@ function nextFile(file: number): SearchPosition {
   return { file: file + 1, offset: 0, lineStart: 0, line: 1, matched: false }
 }
 
-/** True when the opening bytes both hold a NUL and fail to decode as UTF-8. */
-function isBinary(descriptor: number, size: number): boolean {
-  const length = Math.min(BINARY_SNIFF_BYTES, size)
-  if (length === 0) return false
+/**
+ * True when the opening `length` bytes both hold a NUL and fail to decode.
+ *
+ * `length` is clamped by the caller to what the scan budget still allows, so
+ * the sniff cannot read past a ceiling the scan itself would have obeyed.
+ */
+function isBinary(descriptor: number, length: number): boolean {
+  if (length <= 0) return false
   const bytes = Buffer.allocUnsafe(length)
   if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
   // `validUtf8Prefix` allows a sniff that stops mid-scalar, so a cut-short

@@ -273,3 +273,17 @@ test('the depth ceiling is measured from the root, not from the listed directory
     ['--include', '**', '--max-depth', '1'],
   )
 })
+
+test('a listing is still bounded by the file ceiling', async () => {
+  // The ceiling no longer covers the whole tree, which was the point, but one
+  // listing must not materialize an unbounded directory.
+  const files = Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`f${index}.txt`, 'x\n']))
+
+  await withRoot(
+    files,
+    async (server) => {
+      assert.match(await callFailing(server, 'list_directory', { path: '.' }), /file limit exceeded/)
+    },
+    ['--include', '**', '--max-files', '5'],
+  )
+})

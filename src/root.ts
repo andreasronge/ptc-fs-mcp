@@ -207,6 +207,9 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
 
       if (!stat.isFile() || !root.selector.selects(path)) continue
       if (Number(stat.size) > root.limits.maxFileBytes) continue
+      // The ceiling no longer covers the whole tree -- that was the point --
+      // but it still bounds what one listing may materialize.
+      if (listed.length >= root.limits.maxFiles) throw new ToolError('file limit exceeded')
       listed.push({ name: entry.name, kind: 'file', path })
     }
   } finally {

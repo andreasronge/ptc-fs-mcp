@@ -19,19 +19,19 @@ npx -y ptc-fs-mcp --root ./workspace --include '**'
 
 ## Tools
 
-| Tool             | Effect | Returns                                                |
-| ---------------- | ------ | ------------------------------------------------------ |
-| `list_directory` | read   | Sorted, paginated entries under a relative prefix      |
-| `search_files`   | read   | Sorted, paginated paths containing a literal substring |
-| `search_text`    | read   | Paginated literal matches with path and line evidence  |
-
-| `read_text_file` | read | Paginated exact UTF-8 byte chunks |
-| `write_text_file` | write | Replaces one regular file, reports path and bytes |
+| Tool              | Effect | Returns                                                 |
+| ----------------- | ------ | ------------------------------------------------------- |
+| `list_directory`  | read   | Sorted, paginated entries under a relative prefix       |
+| `search_files`    | read   | Sorted, paginated paths containing a literal substring  |
+| `search_text`     | read   | Paginated literal matches with path and line evidence   |
+| `read_text_file`  | read   | Paginated exact UTF-8 byte chunks, from a line if asked |
+| `write_text_file` | write  | Replaces one regular file, reports path and bytes       |
 
 The four read tools accept optional `cursor` and `limit` and return exactly
 `items`, `next_cursor`, and `content_hash`. Start without a cursor and follow
 `next_cursor` until it is null. For `read_text_file`, concatenating item `text`
-reconstructs the file exactly.
+reconstructs the file exactly -- or, when `start_line` was given, exactly the
+part of it from that line on.
 
 ## Live bytes
 
@@ -252,6 +252,14 @@ line rather than the file. Together they identify the compiled artifacts and
 dumps whose every line would be dropped anyway. Listings stay content-blind,
 and `read_text_file` still refuses the same file with `file is not valid
 UTF-8`.
+
+That decision is made from the opening 8 KiB, so it can be wrong in one
+direction worth naming: a file that begins with a binary header and holds real
+text further in is skipped whole, and its matches are not reported. Every tool
+that classifies files this way shares the limitation; the trade is against
+spending a page budget proving a compiled artifact holds nothing, which on one
+real checkout was half the bytes served. Where a root holds such files and
+their text matters, extract it before serving the root.
 
 ### Serving a large root
 
