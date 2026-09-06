@@ -208,9 +208,12 @@ test('deterministic cursors match and resume across independent processes for al
     'b.txt': 'needle b\n',
     'c.txt': 'quiet\n',
   }
+  // The scan budget is pinned so `search_text` still needs a second page after
+  // the default was raised; this test is about cursor identity, not budgets.
+  const budget = ['--max-scan-bytes', '262144']
   await withRoot(files, async (_server, root) => {
-    const first = deterministic(root)
-    const second = deterministic(root)
+    const first = deterministic(root, KEY, budget)
+    const second = deterministic(root, KEY, budget)
     try {
       for (const [name, args] of [
         ['list_directory', { limit: 1 }],

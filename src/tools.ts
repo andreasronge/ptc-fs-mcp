@@ -24,6 +24,7 @@ import { ConfigError, ToolError } from './errors.js'
 import { normalizeRelative } from './paths.js'
 import {
   assertOpenFileIdentity,
+  directoryListing,
   inventory,
   openFileForRead,
   writeTextFile,
@@ -35,8 +36,9 @@ import {
 const MAX_PAGE = 200
 const READ_CHUNK_BYTES = 2_048
 const SEARCH_BUFFER_BYTES = 8_192
-const SEARCH_SCAN_BYTES = 262_144
+const BINARY_SNIFF_BYTES = 8_192
 const MAX_QUERY_BYTES = 256
+const MAX_TERMS = 16
 const MAX_EVIDENCE_BYTES = 1_024
 const SIZING_HASH = `sha256:${'0'.repeat(64)}`
 
@@ -128,7 +130,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     },
     async (args: Record<string, unknown>) => {
       const prefix = args.path === undefined ? '' : requirePath(args.path, 'path')
-      const items = directoryEntries(root, prefix)
+      const items = directoryListing(root, prefix)
       const scope = scopeOf('list_directory', { path: prefix })
       const state = stateOf(items.map((entry) => `${entry.kind}\0${entry.path}`))
       const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
@@ -145,7 +147,9 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'search_files',
     {
       title: 'Search files',
-      description: 'Sorted paths containing a literal substring. Follow next_cursor until null.',
+      description:
+        'Sorted paths containing a literal substring. Pass any_of instead of query to match any of several ' +
+        'substrings, and case_insensitive to fold ASCII letters. Follow next_cursor until null.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(pagedOutput({ path: { type: 'string' } })),
@@ -153,19 +157,29 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           query: { type: 'string', minLength: 1 },
+          any_of: {
+            type: 'array',
+            items: { type: 'string', minLength: 1 },
+            minItems: 1,
+            maxItems: MAX_TERMS,
+          },
+          case_insensitive: { type: 'boolean' },
           cursor: { type: 'string' },
           limit: { type: 'integer', minimum: 1 },
         },
-        required: ['query'],
         additionalProperties: false,
       }),
     },
     async (args: Record<string, unknown>) => {
-      const query = requireQuery(args.query)
+      const terms = requireTerms(args)
+      const needles = terms.values.map((term) => (terms.caseInsensitive ? foldString(term) : term))
       const paths = inventory(root)
         .map((file) => file.path)
-        .filter((path) => path.includes(query))
-      const scope = scopeOf('search_files', { query })
+        .filter((path) => {
+          const candidate = terms.caseInsensitive ? foldString(path) : path
+          return needles.some((needle) => candidate.includes(needle))
+        })
+      const scope = scopeOf('search_files', { terms: terms.values, caseInsensitive: terms.caseInsensitive })
       const state = stateOf(paths)
       const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
       const candidates = paths.map((path, index) => ({
@@ -181,7 +195,9 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'search_text',
     {
       title: 'Search text',
-      description: 'Streaming literal line search. Empty progress pages may carry next_cursor; follow it until null.',
+      description:
+        'Streaming literal line search. Pass any_of instead of query to match any of several substrings, and ' +
+        'case_insensitive to fold ASCII letters. Empty progress pages may carry next_cursor; follow it until null.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(
@@ -191,19 +207,29 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           query: { type: 'string', minLength: 1 },
+          any_of: {
+            type: 'array',
+            items: { type: 'string', minLength: 1 },
+            minItems: 1,
+            maxItems: MAX_TERMS,
+          },
+          case_insensitive: { type: 'boolean' },
           path: { type: 'string' },
           cursor: { type: 'string' },
           limit: { type: 'integer', minimum: 1 },
         },
-        required: ['query'],
         additionalProperties: false,
       }),
     },
     async (args: Record<string, unknown>) => {
-      const query = requireQuery(args.query)
+      const terms = requireTerms(args)
       const prefix = args.path === undefined ? '' : requirePath(args.path, 'path')
       const files = inventory(root, prefix)
-      const scope = scopeOf('search_text', { path: prefix, query })
+      const scope = scopeOf('search_text', {
+        path: prefix,
+        terms: terms.values,
+        caseInsensitive: terms.caseInsensitive,
+      })
       // Content is what a text search tears on. Default mode binds physical
       // observations; deterministic mode binds semantic content identities.
       const stateFiles = deterministic
@@ -218,7 +244,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         (value): value is SearchPosition => isSearchPosition(value, files.length),
         first,
       )
-      const scan = scanText(root, files, query, start, boundedPage(args.limit), deterministic)
+      const scan = scanText(root, files, terms, start, boundedPage(args.limit), deterministic)
       return structured(pageValue(cursors, scope, state, start, scan.candidates, scan.next, resultBudget))
     },
   )
@@ -387,23 +413,6 @@ function contentDigest(
  * access model: a directory appears only because it holds something served,
  * so an unserved directory's name never leaks through a listing.
  */
-function directoryEntries(root: Root, prefix: string): Array<{ name: string; kind: string; path: string }> {
-  const scope = prefix === '' ? '' : `${prefix}/`
-  const entries = new Map<string, 'file' | 'directory'>()
-
-  for (const file of inventory(root, prefix)) {
-    const remainder = file.path.slice(scope.length)
-    if (remainder === '') continue
-    const separator = remainder.indexOf('/')
-    if (separator === -1) entries.set(remainder, 'file')
-    else entries.set(remainder.slice(0, separator), 'directory')
-  }
-
-  return [...entries.entries()]
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([name, kind]) => ({ name, kind, path: scope + name }))
-}
-
 function readPage(
   cursors: CursorCodec,
   descriptor: number,
@@ -457,13 +466,17 @@ function readPage(
 function scanText(
   root: Root,
   files: readonly FileFact[],
-  query: string,
+  terms: Terms,
   start: SearchPosition,
   limit: number,
   failOnObservationChange: boolean,
 ) {
-  const queryBytes = Buffer.from(query, 'utf8')
-  const failure = kmpFailure(queryBytes)
+  // One KMP machine per needle, all advanced over the same byte. A line
+  // matches when any of them completes, so the cursor's single `matched` flag
+  // keeps its meaning however many terms were asked for.
+  const scanBudget = root.limits.maxScanBytes
+  const patterns = compileTerms(terms)
+  const longest = patterns.reduce((widest, pattern) => Math.max(widest, pattern.bytes.length), 0)
   const candidates: Array<Candidate<{ path: string; line: number; text: string }>> = []
   let position = { ...start }
   let scanned = 0
@@ -478,7 +491,7 @@ function scanText(
     })
   }
 
-  while (position.file < files.length && candidates.length < limit && scanned < SEARCH_SCAN_BYTES) {
+  while (position.file < files.length && candidates.length < limit && scanned < scanBudget) {
     const file = files[position.file]!
     let open
     try {
@@ -498,11 +511,23 @@ function scanText(
       if (position.offset > size || position.lineStart > position.offset) {
         throw new ToolError('cursor position is not valid')
       }
-      let matchState = restoreMatchState(descriptor, position, queryBytes, failure)
+      // A NUL in the opening bytes means the file is binary, so every line it
+      // holds would fail to decode and be dropped anyway. Skipping it whole
+      // turns a compiled artifact or a PDF from a hundred empty pages into
+      // one sniffed buffer. The sniff is charged to the scan budget so a root
+      // full of binaries still makes bounded progress per call, and it reads
+      // the same bytes the scan would have read first, so it costs nothing on
+      // a file that is text.
+      if (position.offset === 0 && isBinary(descriptor, size)) {
+        scanned += Math.min(BINARY_SNIFF_BYTES, size)
+        position = nextFile(position.file)
+        continue
+      }
+      const states = restoreMatchStates(descriptor, position, patterns, longest, terms.caseInsensitive)
       const buffer = Buffer.allocUnsafe(Math.min(SEARCH_BUFFER_BYTES, Math.max(size - position.offset, 1)))
 
-      while (position.offset < size && candidates.length < limit && scanned < SEARCH_SCAN_BYTES) {
-        const wanted = Math.min(buffer.length, size - position.offset, SEARCH_SCAN_BYTES - scanned)
+      while (position.offset < size && candidates.length < limit && scanned < scanBudget) {
+        const wanted = Math.min(buffer.length, size - position.offset, scanBudget - scanned)
         const count = readSync(descriptor, buffer, 0, wanted, position.offset)
         if (count <= 0) throw new ToolError('read failed')
 
@@ -523,15 +548,20 @@ function scanText(
             position.lineStart = position.offset
             position.line += 1
             position.matched = false
-            matchState = 0
+            states.fill(0)
             if (candidates.length >= limit) break
             continue
           }
 
-          matchState = kmpStep(queryBytes, failure, matchState, byte)
-          if (matchState === queryBytes.length) {
-            position.matched = true
-            matchState = failure[matchState - 1] ?? 0
+          const probe = terms.caseInsensitive ? foldByte(byte) : byte
+          for (let term = 0; term < patterns.length; term += 1) {
+            const { bytes: termBytes, failure } = patterns[term]!
+            let state = kmpStep(termBytes, failure, states[term]!, probe)
+            if (state === termBytes.length) {
+              position.matched = true
+              state = failure[state - 1] ?? 0
+            }
+            states[term] = state
           }
         }
       }
@@ -556,25 +586,44 @@ function nextFile(file: number): SearchPosition {
   return { file: file + 1, offset: 0, lineStart: 0, line: 1, matched: false }
 }
 
-/** Replays the current line's tail so a resumed scan cannot miss a straddling match. */
-function restoreMatchState(
+/** True when the opening bytes hold a NUL, the standard mark of a binary file. */
+function isBinary(descriptor: number, size: number): boolean {
+  const length = Math.min(BINARY_SNIFF_BYTES, size)
+  if (length === 0) return false
+  const bytes = Buffer.allocUnsafe(length)
+  if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
+  return bytes.includes(0)
+}
+
+/**
+ * Replays the current line's tail so a resumed scan cannot miss a straddling
+ * match. The replay is as long as the widest needle, so every machine sees
+ * enough history regardless of which one eventually matches.
+ */
+function restoreMatchStates(
   descriptor: number,
   position: SearchPosition,
-  query: Buffer,
-  failure: readonly number[],
-): number {
-  const overlap = Math.min(query.length - 1, position.offset - position.lineStart)
-  if (overlap <= 0) return 0
+  patterns: readonly CompiledTerm[],
+  longest: number,
+  caseInsensitive: boolean,
+): number[] {
+  const states = patterns.map(() => 0)
+  const overlap = Math.min(longest - 1, position.offset - position.lineStart)
+  if (overlap <= 0) return states
   const bytes = Buffer.allocUnsafe(overlap)
   if (readSync(descriptor, bytes, 0, overlap, position.offset - overlap) !== overlap) {
     throw new ToolError('read failed')
   }
-  let state = 0
   for (const byte of bytes) {
-    state = kmpStep(query, failure, state, byte)
-    if (state === query.length) state = failure[state - 1] ?? 0
+    const probe = caseInsensitive ? foldByte(byte) : byte
+    for (let term = 0; term < patterns.length; term += 1) {
+      const { bytes: termBytes, failure } = patterns[term]!
+      let state = kmpStep(termBytes, failure, states[term]!, probe)
+      if (state === termBytes.length) state = failure[state - 1] ?? 0
+      states[term] = state
+    }
   }
-  return state
+  return states
 }
 
 /** The matched line, or null when its bytes are not valid UTF-8. */
@@ -725,6 +774,71 @@ function requirePath(value: unknown, field: string): string {
   const normalized = normalizeRelative(value)
   if (normalized === null) throw new ToolError(`${field} is not a relative path inside the root`)
   return normalized
+}
+
+/** One or more literal needles, and how their bytes are compared. */
+interface Terms {
+  readonly values: readonly string[]
+  readonly caseInsensitive: boolean
+}
+
+interface CompiledTerm {
+  readonly bytes: Buffer
+  readonly failure: readonly number[]
+}
+
+/**
+ * ASCII-only case folding.
+ *
+ * Deliberately not Unicode: the scanner is byte-oriented, and full case
+ * folding is neither byte-local nor length-preserving, so it cannot be done
+ * correctly one byte at a time. Folding A-Z is a rule that holds exactly, is
+ * the same on every platform, and covers what identifiers are made of.
+ */
+function foldByte(byte: number): number {
+  return byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte
+}
+
+function foldString(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 0x20))
+}
+
+function compileTerms(terms: Terms): CompiledTerm[] {
+  return terms.values.map((term) => {
+    const bytes = Buffer.from(terms.caseInsensitive ? foldString(term) : term, 'utf8')
+    return { bytes, failure: kmpFailure(bytes) }
+  })
+}
+
+/**
+ * Reads the needles for a search: exactly one of `query` or `any_of`.
+ *
+ * `any_of` is a list rather than a `|` inside `query` on purpose. Splitting a
+ * query on a bare pipe would silently change the meaning of every literal
+ * search containing one -- `string | number` is ordinary source text -- and a
+ * search that quietly matches more than it was asked to is the failure this
+ * server spends errors to avoid.
+ */
+function requireTerms(args: Record<string, unknown>): Terms {
+  if (args.query !== undefined && args.any_of !== undefined) {
+    throw new ToolError('pass either query or any_of, not both')
+  }
+  const values = args.any_of === undefined ? [requireQuery(args.query)] : requireAnyOf(args.any_of)
+  return { values, caseInsensitive: requireFlag(args.case_insensitive, 'case_insensitive') }
+}
+
+function requireAnyOf(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ToolError('any_of must be a non-empty array of strings')
+  }
+  if (value.length > MAX_TERMS) throw new ToolError(`any_of accepts at most ${MAX_TERMS} terms`)
+  return value.map((term) => requireQuery(term))
+}
+
+function requireFlag(value: unknown, field: string): boolean {
+  if (value === undefined) return false
+  if (typeof value !== 'boolean') throw new ToolError(`${field} must be a boolean`)
+  return value
 }
 
 function requireQuery(value: unknown): string {

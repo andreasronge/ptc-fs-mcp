@@ -11,7 +11,7 @@ import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, opendirSync,
 import { join, resolve } from 'node:path'
 
 import { ConfigError, ToolError } from './errors.js'
-import { createSelector, normalizeRelative, posixJoin, type Selector } from './paths.js'
+import { createSelector, DEFAULT_EXCLUDE, normalizeRelative, posixJoin, type Selector } from './paths.js'
 
 /** Bounds on what a single traversal may visit. Exceeding one fails the call. */
 export interface Limits {
@@ -23,6 +23,14 @@ export interface Limits {
   readonly maxFileBytes: number
   /** Source-file bytes considered for one `read_text_file` page. */
   readonly maxReadBytes: number
+  /**
+   * Source-file bytes `search_text` may scan for one page.
+   *
+   * This is a round-trip dial, not a safety one. Every page re-walks the root
+   * to bind its cursor, so on a large tree the walk, not the scan, dominates;
+   * raising this trades a longer single call for far fewer of them.
+   */
+  readonly maxScanBytes: number
   /** Complete decoded MCP result bytes allowed for any tool call. */
   readonly maxResultBytes: number
   /** The largest `write_text_file` payload, in UTF-8 bytes. */
@@ -33,12 +41,13 @@ export const MAX_CONFIGURED_READ_BYTES = 1_048_576
 export const MAX_CONFIGURED_RESULT_BYTES = 1_048_576
 
 export const DEFAULT_LIMITS: Limits = {
-  maxFiles: 4_096,
-  maxDepth: 32,
-  maxDirectories: 8_192,
-  maxEntries: 100_000,
+  maxFiles: 50_000,
+  maxDepth: 64,
+  maxDirectories: 50_000,
+  maxEntries: 1_000_000,
   maxFileBytes: Number.MAX_SAFE_INTEGER,
   maxReadBytes: 16_384,
+  maxScanBytes: 4_194_304,
   maxResultBytes: 48_000,
   maxWriteBytes: 65_536,
 }
@@ -50,6 +59,15 @@ export interface RootOptions {
   readonly include: readonly string[]
   /** Globs that may only narrow what the includes selected. */
   readonly exclude?: readonly string[]
+  /**
+   * Whether to apply `DEFAULT_EXCLUDE` on top of `exclude`. Defaults to true.
+   *
+   * Opting out restores the pre-default behavior for every entry at once,
+   * dependency directories and credential filenames alike; there is no
+   * per-pattern re-inclusion, because ordering-sensitive negation is the part
+   * of ignore files that reliably surprises the person writing them.
+   */
+  readonly defaultExclude?: boolean
   readonly limits?: Partial<Limits>
 }
 
@@ -108,7 +126,110 @@ export function openRoot(options: RootOptions): Root {
   if (stat.isSymbolicLink()) throw new ConfigError('root must not be a symbolic link')
   if (!stat.isDirectory()) throw new ConfigError('root is not a directory')
 
-  return { absolute, selector: createSelector(options.include, options.exclude ?? []), limits }
+  const exclude = [...(options.defaultExclude === false ? [] : DEFAULT_EXCLUDE), ...(options.exclude ?? [])]
+  return { absolute, selector: createSelector(options.include, exclude), limits }
+}
+
+/**
+ * The immediate children of `prefix` that this root serves, sorted by name.
+ *
+ * A directory is listed exactly when it holds at least one served file at any
+ * depth -- the same rule a full inventory produces, and the reason an unserved
+ * directory's name never leaks. But the answer needed per child is a boolean,
+ * not a file list, so each probe stops at the first served file it finds.
+ * Listing one level of a large tree therefore costs a probe per child instead
+ * of an inventory of everything beneath it.
+ */
+export function directoryListing(root: Root, prefix: string): Array<{ name: string; kind: string; path: string }> {
+  const counters = { directories: 0, entries: 0 }
+  const listed: Array<{ name: string; kind: string; path: string }> = []
+
+  let entries
+  try {
+    entries = opendirSync(prefix === '' ? root.absolute : join(root.absolute, prefix))
+  } catch {
+    // No such directory, or not a directory at all. An empty listing is the
+    // same answer a full inventory gave, and it discloses nothing either way.
+    return []
+  }
+
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      counters.entries += 1
+      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
+
+      const path = posixJoin(prefix, entry.name)
+      if (normalizeRelative(path) !== path) continue
+      if (root.selector.excludes(path)) continue
+
+      const absolute = join(entries.path, entry.name)
+      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      if (!stat || stat.isSymbolicLink()) continue
+
+      if (stat.isDirectory()) {
+        if (servesAnything(root, absolute, path, 1, counters)) {
+          listed.push({ name: entry.name, kind: 'directory', path })
+        }
+        continue
+      }
+
+      if (!stat.isFile() || !root.selector.selects(path)) continue
+      if (Number(stat.size) > root.limits.maxFileBytes) continue
+      listed.push({ name: entry.name, kind: 'file', path })
+    }
+  } finally {
+    entries.closeSync()
+  }
+
+  return listed.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+}
+
+/** True as soon as one served file is found anywhere beneath `directory`. */
+function servesAnything(
+  root: Root,
+  directory: string,
+  prefix: string,
+  depth: number,
+  counters: { directories: number; entries: number },
+): boolean {
+  if (depth > root.limits.maxDepth) throw new ToolError('directory depth limit exceeded')
+  counters.directories += 1
+  if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
+
+  let entries
+  try {
+    entries = opendirSync(directory)
+  } catch {
+    return false
+  }
+
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      counters.entries += 1
+      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
+
+      const path = posixJoin(prefix, entry.name)
+      if (normalizeRelative(path) !== path) continue
+      if (root.selector.excludes(path)) continue
+
+      const absolute = join(directory, entry.name)
+      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      if (!stat || stat.isSymbolicLink()) continue
+
+      if (stat.isDirectory()) {
+        if (servesAnything(root, absolute, path, depth + 1, counters)) return true
+        continue
+      }
+
+      if (!stat.isFile() || !root.selector.selects(path)) continue
+      if (Number(stat.size) > root.limits.maxFileBytes) continue
+      return true
+    }
+  } finally {
+    entries.closeSync()
+  }
+
+  return false
 }
 
 /**
@@ -276,6 +397,7 @@ function validateLimits(limits: Limits): void {
     limits.maxEntries,
     limits.maxFileBytes,
     limits.maxReadBytes,
+    limits.maxScanBytes,
     limits.maxResultBytes,
     limits.maxWriteBytes,
   ]
@@ -284,6 +406,7 @@ function validateLimits(limits: Limits): void {
     !Number.isSafeInteger(limits.maxDepth) ||
     limits.maxDepth < 0 ||
     limits.maxReadBytes < 4 ||
+    limits.maxScanBytes < 4_096 ||
     limits.maxReadBytes > MAX_CONFIGURED_READ_BYTES ||
     limits.maxResultBytes < DEFAULT_LIMITS.maxResultBytes ||
     limits.maxResultBytes > MAX_CONFIGURED_RESULT_BYTES

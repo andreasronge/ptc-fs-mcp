@@ -8,6 +8,7 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio'
 
 import { ConfigError } from './errors.js'
 import { createServer, IDENTITY } from './index.js'
+import { compileGlob, DEFAULT_EXCLUDE } from './paths.js'
 import { openRoot, type Limits, type RootOptions } from './root.js'
 
 const USAGE = `ptc-fs-mcp ${IDENTITY.version} -- filesystem MCP server over stdio
@@ -21,8 +22,23 @@ Options:
                           The default is no files.
   --exclude <glob>        Never serve paths matching this glob. Repeatable.
                           May only narrow what --include selected.
+  --no-default-exclude    Do not apply the built-in excludes. Those cover
+                          dependency and build directories such as
+                          node_modules, dist, and .git, plus credential
+                          filenames such as .env and *.pem. They only ever
+                          narrow, and this flag drops all of them at once.
+  --max-files <n>         Most files one traversal may select. Default 50000.
+  --max-directories <n>   Most directories one traversal may enter.
+                          Default 50000.
+  --max-depth <n>         Deepest directory nesting to walk. Default 64.
+  --max-entries <n>       Most directory entries one traversal may read.
+                          Default 1000000.
   --max-file-bytes <n>    Do not serve files larger than this.
   --max-read-bytes <n>    Source bytes considered per read page. Default 16384.
+  --max-scan-bytes <n>    Source bytes scanned per search_text page. Default
+                          4194304. Every page re-walks the root to bind its
+                          cursor, so this trades a longer call for far fewer
+                          of them; the result ceiling still bounds a page.
   --max-result-bytes <n>  Complete decoded tool result ceiling. Default 48000.
                           Valid range 48000-1048576. Must not exceed the
                           consumer's effective limit; consumers below 48000
@@ -56,6 +72,7 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
   const exclude: string[] = []
   const limits: { -readonly [K in keyof Limits]?: Limits[K] } = {}
   let root: string | undefined
+  let defaultExclude: boolean | undefined
   let cursorKeyEnv: string | undefined
   let maxCursorHashBytes: number | undefined
 
@@ -64,13 +81,24 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
     const value = argv[index + 1]
 
     if (flag === '--help' || flag === '--version') continue
+    // Valueless, so it must be settled before the arity check below consumes
+    // whatever followed it as an operand.
+    if (flag === '--no-default-exclude') {
+      defaultExclude = false
+      continue
+    }
     if (value === undefined) throw new ConfigError(`missing value for ${flag}`)
 
     if (flag === '--root') root = value
     else if (flag === '--include') include.push(value)
     else if (flag === '--exclude') exclude.push(value)
+    else if (flag === '--max-files') limits.maxFiles = positiveInteger(value, flag)
+    else if (flag === '--max-directories') limits.maxDirectories = positiveInteger(value, flag)
+    else if (flag === '--max-depth') limits.maxDepth = positiveInteger(value, flag)
+    else if (flag === '--max-entries') limits.maxEntries = positiveInteger(value, flag)
     else if (flag === '--max-file-bytes') limits.maxFileBytes = positiveInteger(value, flag)
     else if (flag === '--max-read-bytes') limits.maxReadBytes = positiveInteger(value, flag)
+    else if (flag === '--max-scan-bytes') limits.maxScanBytes = positiveInteger(value, flag)
     else if (flag === '--max-result-bytes') limits.maxResultBytes = positiveInteger(value, flag)
     else if (flag === '--max-write-bytes') limits.maxWriteBytes = positiveInteger(value, flag)
     else if (flag === '--cursor-key-env') {
@@ -88,6 +116,7 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
     include,
     exclude,
     limits,
+    ...(defaultExclude === undefined ? {} : { defaultExclude }),
     ...(cursorKeyEnv === undefined ? {} : { cursorKeyEnv }),
     ...(maxCursorHashBytes === undefined ? {} : { maxCursorHashBytes }),
   }
@@ -104,6 +133,12 @@ function cursorKeyFromEnvironment(name: string | undefined): Buffer | undefined 
     throw new ConfigError('cursor key environment variable is malformed or contains fewer than 32 bytes')
   }
   return key
+}
+
+/** Literal include patterns -- no wildcards -- that a built-in exclude covers. */
+function literalIncludesDefeatedByDefaults(include: readonly string[]): string[] {
+  const defaults = DEFAULT_EXCLUDE.map(compileGlob)
+  return include.filter((pattern) => !/[*?]/.test(pattern) && defaults.some((excluded) => excluded.test(pattern)))
 }
 
 function positiveInteger(value: string, flag: string): number {
@@ -137,6 +172,19 @@ export function main(argv: readonly string[]): void {
         'installation maps the write tool.\n',
     )
   }
+  // Excludes win over includes, so a default can silently defeat an include the
+  // operator wrote on purpose -- `--include '.env'` is the sharp case. Only
+  // literal patterns are checked: for those the conflict is a fact, while for a
+  // wildcard it would be a guess, and the same reasoning that keeps
+  // servesRootLevel from attempting regex intersection applies here.
+  const defeated = parsed.defaultExclude === false ? [] : literalIncludesDefeatedByDefaults(parsed.include)
+  if (defeated.length > 0) {
+    process.stderr.write(
+      `ptc-fs-mcp: --include ${defeated.join(', ')} matches a built-in exclude, so nothing it names is served. ` +
+        'Pass --no-default-exclude to drop the built-in list.\n',
+    )
+  }
+
   const transport = serveStdio(
     () =>
       createServer(root, IDENTITY, {

@@ -36,15 +36,22 @@ test('search_text traverses far beyond one page', async () => {
 test('search_text makes cursor progress through a huge sparse line', async () => {
   const text = `${'a'.repeat(600_000)}needle\n`
 
-  await withRoot({ 'sparse.txt': text }, async (server) => {
-    const first = await call(server, 'search_text', { query: 'needle', limit: 1 })
-    assert.deepEqual(first.items, [], 'the scan budget stops before the match')
-    assert.ok(first.next_cursor, 'a budget stop must still return a progress cursor')
+  // The scan budget is pinned rather than inherited, so this keeps testing the
+  // empty-progress-page path regardless of what the default is tuned to.
+  const scoped = ['--include', '**', '--max-scan-bytes', '262144']
+  await withRoot(
+    { 'sparse.txt': text },
+    async (server) => {
+      const first = await call(server, 'search_text', { query: 'needle', limit: 1 })
+      assert.deepEqual(first.items, [], 'the scan budget stops before the match')
+      assert.ok(first.next_cursor, 'a budget stop must still return a progress cursor')
 
-    const matches = await collect(server, 'search_text', { query: 'needle', limit: 1 })
-    assert.equal(matches.length, 1)
-    assert.equal(matches[0].line, 1)
-  })
+      const matches = await collect(server, 'search_text', { query: 'needle', limit: 1 })
+      assert.equal(matches.length, 1)
+      assert.equal(matches[0].line, 1)
+    },
+    scoped,
+  )
 })
 
 test('a match straddling the scan buffer boundary is still found', async () => {
@@ -118,5 +125,135 @@ test('search results are stable and reproducible across identical calls', async 
     const first = await call(server, 'search_text', { query: 'line' })
     const second = await call(server, 'search_text', { query: 'line' })
     assert.deepEqual(first, second, 'an unchanged tree must give byte-identical results and hashes')
+  })
+})
+
+test('any_of matches a line containing any one of the terms', async () => {
+  await withRoot(
+    { 'a.txt': 'has TODO here\n', 'b.txt': 'has FIXME here\n', 'c.txt': 'has neither\n' },
+    async (server) => {
+      const matches = await collect(server, 'search_text', { any_of: ['TODO', 'FIXME'] })
+      assert.deepEqual(
+        matches.map((match) => match.path),
+        ['a.txt', 'b.txt'],
+      )
+    },
+  )
+})
+
+test('a line matching two terms at once is reported once', async () => {
+  await withRoot({ 'both.txt': 'TODO and FIXME on one line\n' }, async (server) => {
+    const matches = await collect(server, 'search_text', { any_of: ['TODO', 'FIXME'] })
+    assert.equal(matches.length, 1)
+  })
+})
+
+test('search_files accepts any_of over the path', async () => {
+  await withRoot({ 'src/a.ts': 'x\n', 'test/b.mjs': 'x\n', 'docs/c.md': 'x\n' }, async (server) => {
+    assert.deepEqual(await collect(server, 'search_files', { any_of: ['.ts', '.mjs'] }), [
+      { path: 'src/a.ts' },
+      { path: 'test/b.mjs' },
+    ])
+  })
+})
+
+test('case_insensitive folds ASCII letters in both tools', async () => {
+  await withRoot({ 'Mixed.TXT': 'A Needle Here\n' }, async (server) => {
+    assert.equal((await collect(server, 'search_text', { query: 'needle' })).length, 0)
+    assert.equal((await collect(server, 'search_text', { query: 'NEEDLE', case_insensitive: true })).length, 1)
+    assert.deepEqual(await collect(server, 'search_files', { query: 'mixed.txt', case_insensitive: true }), [
+      { path: 'Mixed.TXT' },
+    ])
+  })
+})
+
+test('case folding is ASCII only, so non-ASCII case is left alone', async () => {
+  await withRoot({ 'u.txt': 'CAFÉ\n' }, async (server) => {
+    assert.equal((await collect(server, 'search_text', { query: 'café', case_insensitive: true })).length, 0)
+    assert.equal((await collect(server, 'search_text', { query: 'CAFÉ', case_insensitive: true })).length, 1)
+  })
+})
+
+test('a multi-term match straddling the scan buffer boundary is still found', async () => {
+  const text = `${'a'.repeat(8_190)}needle\n`
+
+  await withRoot({ 'straddle.txt': text }, async (server) => {
+    assert.equal((await collect(server, 'search_text', { any_of: ['zz', 'needle'] })).length, 1)
+    assert.equal(
+      (await collect(server, 'search_text', { any_of: ['zz', 'NEEDLE'], case_insensitive: true })).length,
+      1,
+      'the replayed line tail must be folded the same way the scan is',
+    )
+  })
+})
+
+test('query and any_of are mutually exclusive, and one is required', async () => {
+  await withFixture(async (server) => {
+    // These two cannot be said in JSON Schema, so the tool says them itself.
+    assert.match(
+      await callFailing(server, 'search_text', { query: 'a', any_of: ['b'] }),
+      /pass either query or any_of, not both/,
+    )
+    assert.match(await callFailing(server, 'search_text', {}), /query must be a non-empty string/)
+  })
+})
+
+test('the published schema bounds any_of and case_insensitive before the tool runs', async () => {
+  await withFixture(async (server) => {
+    // Declared rather than merely enforced, so a client reading inputSchema
+    // sees the same limits the server applies. Each refusal names its field.
+    for (const args of [
+      { any_of: [] },
+      { any_of: Array.from({ length: 17 }, (_, index) => `t${index}`) },
+      { any_of: ['ok', 7] },
+    ]) {
+      assert.match(await callFailing(server, 'search_text', args), /any_of/)
+    }
+    assert.match(
+      await callFailing(server, 'search_text', { query: 'a', case_insensitive: 'yes' }),
+      /case_insensitive/,
+    )
+  })
+})
+
+test('a cursor is bound to the terms and the folding it was issued for', async () => {
+  await withRoot({ 'a.txt': 'one\ntwo\nthree\n' }, async (server) => {
+    const first = await call(server, 'search_text', { any_of: ['one', 'two'], limit: 1 })
+    assert.ok(first.next_cursor)
+
+    for (const args of [
+      { any_of: ['one', 'three'] },
+      { any_of: ['one'] },
+      { query: 'one' },
+      { any_of: ['one', 'two'], case_insensitive: true },
+    ]) {
+      const message = await callFailing(server, 'search_text', { ...args, cursor: first.next_cursor })
+      assert.match(message, /cursor/)
+    }
+  })
+})
+
+test('search_text skips a binary file whole rather than scanning it', async () => {
+  const binary = Buffer.concat([Buffer.from('needle'), Buffer.from([0x00]), Buffer.alloc(200_000, 0x41)])
+
+  await withRoot({ 'blob.bin': binary, 'notes.txt': 'needle in text\n' }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
+      ['notes.txt'],
+      'a NUL in the opening bytes means every line would fail to decode anyway',
+    )
+  })
+})
+
+test('a binary file is still listed and still refuses to be read as text', async () => {
+  const binary = Buffer.from([0x00, 0xff, 0xfe, 0x41])
+
+  await withRoot({ 'blob.bin': binary }, async (server) => {
+    assert.deepEqual(
+      (await call(server, 'list_directory', { path: '.' })).items.map((entry) => entry.name),
+      ['blob.bin'],
+      'listings stay content-blind; only the scanner sniffs',
+    )
+    assert.match(await callFailing(server, 'read_text_file', { path: 'blob.bin' }), /not valid UTF-8/)
   })
 })

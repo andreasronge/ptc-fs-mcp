@@ -41,9 +41,9 @@ export function createServer(
   return build(root, hasIdentity ? identityOrOptions : IDENTITY, hasIdentity ? options : identityOrOptions)
 }
 
-export { openRoot, DEFAULT_LIMITS } from './root.js'
+export { openRoot, inventory, directoryListing, DEFAULT_LIMITS } from './root.js'
 export type { Root, RootOptions, Limits, FileFact } from './root.js'
 export { ConfigError, ToolError } from './errors.js'
-export { normalizeRelative, compileGlob, createSelector } from './paths.js'
+export { normalizeRelative, compileGlob, createSelector, DEFAULT_EXCLUDE } from './paths.js'
 export type { Selector } from './paths.js'
 export type { ServerIdentity, ServerOptions } from './tools.js'

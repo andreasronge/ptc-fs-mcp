@@ -13,10 +13,13 @@ const MAX_PATH_LENGTH = 1_024
  * string is not a relative path inside a confined root.
  *
  * Absolute paths, `.`/`..` segments, NUL bytes, backslashes, and Windows drive
- * prefixes are all rejected. The empty string normalizes to the root itself.
+ * prefixes are all rejected. The empty string normalizes to the root itself,
+ * and so does a bare `.` -- the universal idiom for "here", and the first
+ * thing a client reaches for. Only that exact string is accepted: `./lib` and
+ * `lib/.` still carry a `.` segment and are still rejected.
  */
 export function normalizeRelative(value: string): string | null {
-  if (value === '') return ''
+  if (value === '' || value === '.') return ''
   if (value.includes('\0') || value.startsWith('/') || value.includes('\\')) return null
   if (value.length > MAX_PATH_LENGTH || /^[a-zA-Z]:/.test(value)) return null
 
@@ -72,6 +75,77 @@ export function compileGlob(pattern: string): RegExp {
 export function matchesRootLevel(pattern: string): boolean {
   return !pattern.split('**/').join('').includes('/')
 }
+
+/**
+ * Directories that hold dependency or tool output rather than the material a
+ * client came for. A walk that inventories them spends its budget on them and
+ * can return empty pages while a real match waits behind them.
+ *
+ * Every name here is one no person picks for their own data. That rule is
+ * doing real work: `build`, `dist`, `target`, `coverage`, and `cover` are all
+ * output directories in some toolchain and all ordinary words in a business
+ * file share, so none of them is on this list. Excluding a directory hides it
+ * silently, and hiding a folder of real data is a worse failure than listing a
+ * folder of build output. Where a root is known to be a checkout, name those
+ * directories with `--exclude`.
+ */
+const DEFAULT_EXCLUDED_DIRECTORIES = [
+  '.bundle',
+  '.cargo',
+  '.elixir_ls',
+  '.git',
+  '.gradle',
+  '.hg',
+  '.mypy_cache',
+  '.next',
+  '.nuxt',
+  '.parcel-cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.svn',
+  '.terraform',
+  '.tox',
+  '.turbo',
+  '.venv',
+  '__pycache__',
+  '_build',
+  'bower_components',
+  'deps',
+  'node_modules',
+] as const
+
+/**
+ * Filenames that are credentials far more often than they are content.
+ *
+ * `*.key` is deliberately absent: it is the Apple Keynote extension as well as
+ * a private-key one, and a file share that silently hides every presentation
+ * is worse than one that serves a key file the include rules already allowed.
+ */
+const DEFAULT_EXCLUDED_FILES = [
+  '.env',
+  '.env.*',
+  '*.p12',
+  '*.pem',
+  '*.pfx',
+  'id_dsa',
+  'id_ecdsa',
+  'id_ed25519',
+  'id_rsa',
+] as const
+
+/**
+ * The excludes a root applies unless the host opts out.
+ *
+ * Every entry is an ordinary `--exclude` glob, so this list can only narrow
+ * what `--include` selected -- the same one-way rule the flag already obeys.
+ * Each directory contributes two patterns: the directory itself, so a walk
+ * skips it without descending, and its contents, so naming a path inside one
+ * directly is refused too.
+ */
+export const DEFAULT_EXCLUDE: readonly string[] = [
+  ...DEFAULT_EXCLUDED_DIRECTORIES.flatMap((name) => [`**/${name}`, `**/${name}/**`]),
+  ...DEFAULT_EXCLUDED_FILES.map((glob) => `**/${glob}`),
+]
 
 /** Decides which relative paths a root serves. The default is no files. */
 export interface Selector {
