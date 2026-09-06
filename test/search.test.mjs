@@ -286,7 +286,7 @@ test('the binary sniff obeys the scan budget rather than reading past it', async
         'a clamped sniff must still classify, and the traversal must still finish',
       )
     },
-    ['--include', '**', '--max-scan-bytes', '8192'],
+    ['--include', '**', '--max-scan-bytes', '16384'],
   )
 })
 
@@ -337,7 +337,7 @@ test('classification does not depend on how the pages happened to fall', async (
   const binary = Buffer.concat([Buffer.alloc(20_000, 0xc0), Buffer.from([0x00])])
   const tree = { 'a-filler.txt': filler, 'b-blob.bin': binary, 'c-notes.txt': 'needle in text\n' }
 
-  for (const extra of [[], ['--max-scan-bytes', '8192'], ['--max-scan-bytes', '9000']]) {
+  for (const extra of [[], ['--max-scan-bytes', '16384'], ['--max-scan-bytes', '40000']]) {
     await withRoot(
       tree,
       async (server) => {
@@ -368,11 +368,12 @@ test('a short binary file with no trailing newline is classified', async () => {
   })
 })
 
-test('--max-scan-bytes may not be set below one binary sniff', async () => {
-  // A budget smaller than one sniff could not hold it, and the sniff is a
-  // fixed size so that classification does not depend on the page. Refusing
-  // the configuration is what keeps both of those true at once.
-  const server = startServer(['--root', process.cwd(), '--include', '**', '--max-scan-bytes', '4096'])
+test('--max-scan-bytes may not be set below two binary sniffs', async () => {
+  // The sniff is a fixed size so classification does not depend on the page,
+  // and both it and the scanner's re-read are charged. A budget one sniff
+  // could exhaust would leave a page unable to scan anything, so it is
+  // refused rather than allowed to spin.
+  const server = startServer(['--root', process.cwd(), '--include', '**', '--max-scan-bytes', '12000'])
   const code = await new Promise((resolve) => server.child.once('exit', resolve))
   assert.equal(code, 64)
   assert.match(server.stderr(), /limits are not valid/)

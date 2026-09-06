@@ -37,7 +37,7 @@ Options:
   --max-file-bytes <n>    Do not serve files larger than this.
   --max-read-bytes <n>    Source bytes considered per read page. Default 16384.
   --max-scan-bytes <n>    Source bytes scanned per search_text page. Default
-                          4194304, minimum 8192. Every page re-walks the root
+                          4194304, minimum 16384. Every page re-walks the root
                           to bind its cursor, so this trades a longer call for
                           far fewer of them; the result ceiling still bounds a
                           page. The floor holds one binary sniff.

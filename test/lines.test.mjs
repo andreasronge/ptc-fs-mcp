@@ -85,15 +85,15 @@ test('a line beyond the scan ceiling fails with something actionable', async () 
         /start_line is further into the file than one page may scan/,
       )
     },
-    ['--include', '**', '--max-scan-bytes', '8192'],
+    ['--include', '**', '--max-scan-bytes', '16384'],
   )
 })
 
 test('the start_line scan cannot read past its budget in a single buffer', async () => {
-  // The newline sits at byte 10000, inside the second 8 KiB read but beyond
-  // the 8192 ceiling. Reading a whole buffer regardless would have accepted
-  // it and quietly scanned past the limit the ceiling exists to impose.
-  const text = `${'a'.repeat(10_000)}\nsecond line\n`
+  // The newline sits at byte 20000, inside a whole 8 KiB read but beyond the
+  // 16384 ceiling. Reading a whole buffer regardless would have accepted it
+  // and quietly scanned past the limit the ceiling exists to impose.
+  const text = `${'a'.repeat(20_000)}\nsecond line\n`
 
   await withRoot(
     { 'wide.txt': text },
@@ -103,6 +103,6 @@ test('the start_line scan cannot read past its budget in a single buffer', async
         /start_line is further into the file than one page may scan/,
       )
     },
-    ['--include', '**', '--max-scan-bytes', '8192'],
+    ['--include', '**', '--max-scan-bytes', '16384'],
   )
 })

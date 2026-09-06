@@ -100,23 +100,23 @@ only cover a bounded capture, and this server does not take one.
 ptc-fs-mcp --root ./workspace --include 'lib/**' --include 'docs/**' --exclude '**/secrets/**'
 ```
 
-| Option                        | Meaning                                                                     |
-| ----------------------------- | --------------------------------------------------------------------------- |
-| `--root <dir>`                | Directory to confine to. Required.                                          |
-| `--include <glob>`            | Serve matching paths. Required, repeatable.                                 |
-| `--exclude <glob>`            | Never serve matching paths. Repeatable; may only narrow.                    |
-| `--no-default-exclude`        | Drop the built-in excludes described below.                                 |
-| `--max-files <n>`             | Most files one traversal may select. Default 50000.                         |
-| `--max-directories <n>`       | Most directories one traversal may enter. Default 50000.                    |
-| `--max-depth <n>`             | Deepest directory nesting to walk. Default 64.                              |
-| `--max-entries <n>`           | Most directory entries one traversal may read. Default 1000000.             |
-| `--max-scan-bytes <n>`        | Source bytes scanned per `search_text` page. Default 4194304, minimum 8192. |
-| `--max-file-bytes <n>`        | Do not serve files larger than this.                                        |
-| `--max-read-bytes <n>`        | Source bytes considered per read page. Default 16384.                       |
-| `--max-result-bytes <n>`      | Complete decoded tool result ceiling. Default 48000.                        |
-| `--max-write-bytes <n>`       | Largest `write_text_file` payload. Default 65536.                           |
-| `--cursor-key-env <name>`     | Read a stable base64url cursor key from this environment variable.          |
-| `--max-cursor-hash-bytes <n>` | File bytes hashed per deterministic call. Default 16777216.                 |
+| Option                        | Meaning                                                                      |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `--root <dir>`                | Directory to confine to. Required.                                           |
+| `--include <glob>`            | Serve matching paths. Required, repeatable.                                  |
+| `--exclude <glob>`            | Never serve matching paths. Repeatable; may only narrow.                     |
+| `--no-default-exclude`        | Drop the built-in excludes described below.                                  |
+| `--max-files <n>`             | Most files one traversal may select. Default 50000.                          |
+| `--max-directories <n>`       | Most directories one traversal may enter. Default 50000.                     |
+| `--max-depth <n>`             | Deepest directory nesting to walk. Default 64.                               |
+| `--max-entries <n>`           | Most directory entries one traversal may read. Default 1000000.              |
+| `--max-scan-bytes <n>`        | Source bytes scanned per `search_text` page. Default 4194304, minimum 16384. |
+| `--max-file-bytes <n>`        | Do not serve files larger than this.                                         |
+| `--max-read-bytes <n>`        | Source bytes considered per read page. Default 16384.                        |
+| `--max-result-bytes <n>`      | Complete decoded tool result ceiling. Default 48000.                         |
+| `--max-write-bytes <n>`       | Largest `write_text_file` payload. Default 65536.                            |
+| `--cursor-key-env <name>`     | Read a stable base64url cursor key from this environment variable.           |
+| `--max-cursor-hash-bytes <n>` | File bytes hashed per deterministic call. Default 16777216.                  |
 
 The cursor key must be canonical unpadded base64url encoding of at least 32
 bytes (256 bits). If the named variable is missing, empty, malformed, or too

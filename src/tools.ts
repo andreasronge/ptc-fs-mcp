@@ -545,8 +545,13 @@ function scanText(
         // the cursor resumes at this same file with a full budget -- but only
         // once work has been done, so a page always makes progress.
         if (sniff > scanBudget - scanned && scanned > 0) break
-        if (isBinary(descriptor, sniff, sniff === size)) {
-          scanned += sniff
+        const binary = isBinary(descriptor, sniff, sniff === size)
+        // Charged either way. The scanner re-reads these bytes on the text
+        // path, and a budget that counted them once would bound half the I/O
+        // it claims to. The floor is two sniffs, so a page can always scan
+        // after paying for one.
+        scanned += sniff
+        if (binary) {
           // The skip is still an observation of this file, so it answers to
           // the same identity check the scanned path does: a file mutated
           // under the sniff must reject rather than be silently passed over.
