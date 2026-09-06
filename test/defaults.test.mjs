@@ -97,7 +97,7 @@ test('credential filenames are excluded by default', async () => {
   await withRoot(TREE, async (server) => {
     for (const path of ['.env', '.env.local', 'server.pem']) {
       const message = await callFailing(server, 'read_text_file', { path })
-      assert.match(message, /not served by this root|no --include pattern/)
+      assert.match(message, /--exclude pattern|not served by this root|no --include pattern/)
     }
     const paths = await collect(server, 'search_files', { query: 'env' })
     assert.deepEqual(paths, [], 'an excluded path is never inventoried, so it cannot leak through search either')
@@ -239,7 +239,7 @@ test('the built-in excludes match without regard to case', async () => {
     { 'NODE_MODULES/pkg.js': 'leaked\n', '.ENV': 'TOKEN=leaked\n', 'app.js': 'kept\n' },
     async (server) => {
       assert.deepEqual(await collect(server, 'search_files', { any_of: ['pkg', 'ENV'] }), [])
-      assert.match(await callFailing(server, 'read_text_file', { path: 'NODE_MODULES/pkg.js' }), /not served/)
+      assert.match(await callFailing(server, 'read_text_file', { path: 'NODE_MODULES/pkg.js' }), /--exclude pattern/)
       assert.deepEqual(
         (await collect(server, 'search_text', { query: 'kept' })).map((match) => match.path),
         ['app.js'],
@@ -285,5 +285,42 @@ test('a listing is still bounded by the file ceiling', async () => {
       assert.match(await callFailing(server, 'list_directory', { path: '.' }), /file limit exceeded/)
     },
     ['--include', '**', '--max-files', '5'],
+  )
+})
+
+test('--max-depth 0 is accepted, and means the root may hold no directories', async () => {
+  // A ceiling refuses the call rather than truncating the walk -- that is how
+  // every other ceiling here behaves -- so zero serves a flat root and fails
+  // one with a subdirectory. The point of the test is that the CLI accepts it
+  // at all: `positiveInteger` used to reject the value `openRoot` allows.
+  await withRoot(
+    { 'top.txt': 'x\n' },
+    async (server) => {
+      assert.deepEqual(
+        (await collect(server, 'search_files', { query: '.txt' })).map((entry) => entry.path),
+        ['top.txt'],
+      )
+    },
+    ['--include', '**', '--max-depth', '0'],
+  )
+
+  await withRoot(
+    { 'top.txt': 'x\n', 'sub/deep.txt': 'x\n' },
+    async (server) => {
+      assert.match(await callFailing(server, 'search_files', { query: '.txt' }), /directory depth limit exceeded/)
+    },
+    ['--include', '**', '--max-depth', '0'],
+  )
+})
+
+test('the file ceiling bounds listed directories, not only listed files', async () => {
+  const files = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`d${index}/x.txt`, 'x\n']))
+
+  await withRoot(
+    files,
+    async (server) => {
+      assert.match(await callFailing(server, 'list_directory', { path: '.' }), /file limit exceeded/)
+    },
+    ['--include', '**', '--max-files', '3'],
   )
 })

@@ -95,7 +95,9 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
     else if (flag === '--exclude') exclude.push(value)
     else if (flag === '--max-files') limits.maxFiles = positiveInteger(value, flag)
     else if (flag === '--max-directories') limits.maxDirectories = positiveInteger(value, flag)
-    else if (flag === '--max-depth') limits.maxDepth = positiveInteger(value, flag)
+    // Zero is a meaningful ceiling -- serve the root's own files and nothing
+    // below -- so this one flag accepts it where the others do not.
+    else if (flag === '--max-depth') limits.maxDepth = nonNegativeInteger(value, flag)
     else if (flag === '--max-entries') limits.maxEntries = positiveInteger(value, flag)
     else if (flag === '--max-file-bytes') limits.maxFileBytes = positiveInteger(value, flag)
     else if (flag === '--max-read-bytes') limits.maxReadBytes = positiveInteger(value, flag)
@@ -140,6 +142,11 @@ function cursorKeyFromEnvironment(name: string | undefined): Buffer | undefined 
 function literalIncludesDefeatedByDefaults(include: readonly string[]): string[] {
   const defaults = DEFAULT_EXCLUDE.map((pattern) => compileGlob(pattern, 'i'))
   return include.filter((pattern) => !/[*?]/.test(pattern) && defaults.some((excluded) => excluded.test(pattern)))
+}
+
+function nonNegativeInteger(value: string, flag: string): number {
+  if (value === '0') return 0
+  return positiveInteger(value, flag)
 }
 
 function positiveInteger(value: string, flag: string): number {

@@ -157,6 +157,15 @@ export interface Selector {
   /** True when the path is excluded, so a directory walk may skip it whole. */
   readonly excludes: (path: string) => boolean
   /**
+   * True when the path or any directory above it is excluded.
+   *
+   * The walk gets this for free by pruning as it descends, so `excludes` above
+   * stays a single cheap test on the path it was handed. A tool that opens a
+   * path directly skips that descent, and `--exclude secret` plainly means the
+   * files under it too, so those call sites check the whole chain instead.
+   */
+  readonly excludesAncestor: (path: string) => boolean
+  /**
    * True when some include pattern can reach the root's own top level.
    *
    * `write_text_file` names one basename, so it writes into the root itself.
@@ -196,9 +205,18 @@ export function createSelector(
   const matches = (patterns: readonly RegExp[], path: string): boolean =>
     patterns.some((pattern) => pattern.test(path))
 
+  const excludesAncestor = (path: string): boolean => {
+    for (let cursor = path; cursor !== ''; cursor = cursor.slice(0, Math.max(cursor.lastIndexOf('/'), 0))) {
+      if (matches(excluded, cursor)) return true
+      if (!cursor.includes('/')) break
+    }
+    return false
+  }
+
   return {
     selects: (path) => matches(included, path) && !matches(excluded, path),
     excludes: (path) => matches(excluded, path),
+    excludesAncestor,
     servesRootLevel: include.some(matchesRootLevel),
   }
 }

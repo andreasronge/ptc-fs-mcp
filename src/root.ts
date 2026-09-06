@@ -145,6 +145,7 @@ export function openRoot(options: RootOptions): Root {
 export function resolveDirectory(root: Root, prefix: string): string | null {
   let absolute = root.absolute
   if (prefix === '') return absolute
+  if (root.selector.excludesAncestor(prefix)) return null
 
   for (const segment of prefix.split('/')) {
     absolute = join(absolute, segment)
@@ -200,6 +201,7 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
 
       if (stat.isDirectory()) {
         if (servesAnything(root, absolute, path, depth + 1, counters)) {
+          if (listed.length >= root.limits.maxFiles) throw new ToolError('file limit exceeded')
           listed.push({ name: entry.name, kind: 'directory', path })
         }
         continue
@@ -351,6 +353,10 @@ export function openFileForRead(root: Root, path: string): OpenFile {
   // The parent chain is checked before the descriptor is opened, for the same
   // reason resolveDirectory exists: O_NOFOLLOW below guards the final name
   // only, so a symlinked ancestor would otherwise be followed by the kernel.
+  // The exclude test comes first so the refusal names the rule that actually
+  // refused, rather than the generic message resolveDirectory would give for
+  // the same path.
+  if (root.selector.excludesAncestor(path)) throw new ToolError('path matches an --exclude pattern of this root')
   const separator = path.lastIndexOf('/')
   if (separator !== -1 && resolveDirectory(root, path.slice(0, separator)) === null) {
     throw new ToolError('path is not served by this root')

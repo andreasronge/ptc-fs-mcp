@@ -185,3 +185,36 @@ test('a search scoped to a symlinked prefix finds nothing', async () => {
     assert.deepEqual(page.items, [])
   })
 })
+
+test('an excluded directory cannot be reached by naming it directly', async () => {
+  // The walk prunes at the excluded directory, so it never sees what is
+  // under it. Naming a path skips that descent, and `--exclude secret`
+  // plainly means the files under it too.
+  await withRoot(
+    { 'secret/creds.txt': 'classified\n', 'app.txt': 'served\n' },
+    async (server) => {
+      assert.deepEqual((await call(server, 'list_directory', { path: 'secret' })).items, [])
+      assert.match(await callFailing(server, 'read_text_file', { path: 'secret/creds.txt' }), /--exclude pattern/)
+      assert.deepEqual((await call(server, 'search_text', { query: 'classified', path: 'secret' })).items, [])
+      assert.deepEqual(
+        (await collect(server, 'search_text', { query: 'served' })).map((match) => match.path),
+        ['app.txt'],
+      )
+    },
+    ['--include', '**', '--exclude', 'secret'],
+  )
+})
+
+test('an exclude deep in the tree still covers everything under it', async () => {
+  await withRoot(
+    { 'a/b/hide/x.txt': 'hidden\n', 'a/b/keep/y.txt': 'kept\n' },
+    async (server) => {
+      assert.match(await callFailing(server, 'read_text_file', { path: 'a/b/hide/x.txt' }), /--exclude pattern/)
+      assert.deepEqual(
+        (await call(server, 'list_directory', { path: 'a/b' })).items.map((e) => e.name),
+        ['keep'],
+      )
+    },
+    ['--include', '**', '--exclude', 'a/b/hide'],
+  )
+})
