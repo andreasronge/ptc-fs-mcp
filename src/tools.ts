@@ -537,11 +537,19 @@ function scanText(
       // and dumps that made searching a real root cost a hundred empty pages.
       // The sniff is charged to the scan budget, and on a file that is text it
       // reads the same bytes the scan would have read first.
-      const sniff = Math.min(BINARY_SNIFF_BYTES, size, scanBudget - scanned)
-      if (position.offset === 0 && sniff > 0 && isBinary(descriptor, sniff)) {
-        scanned += sniff
-        position = nextFile(position.file)
-        continue
+      if (position.offset === 0) {
+        const sniff = Math.min(BINARY_SNIFF_BYTES, size)
+        // The sniff is a fixed size rather than whatever the budget has left,
+        // so a file is classified the same way however the pages happened to
+        // fall. When the remainder cannot cover it, this page stops here and
+        // the cursor resumes at this same file with a full budget -- but only
+        // once work has been done, so a page always makes progress.
+        if (sniff > scanBudget - scanned && scanned > 0) break
+        if (isBinary(descriptor, sniff)) {
+          scanned += sniff
+          position = nextFile(position.file)
+          continue
+        }
       }
       const states = restoreMatchStates(descriptor, position, patterns, longest, terms.caseInsensitive)
       const buffer = Buffer.allocUnsafe(Math.min(SEARCH_BUFFER_BYTES, Math.max(size - position.offset, 1)))
@@ -624,16 +632,20 @@ function isBinary(descriptor: number, length: number): boolean {
   const bytes = Buffer.allocUnsafe(length)
   if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
 
-  for (let start = 0; start < bytes.length; ) {
-    const newline = bytes.indexOf(0x0a, start)
-    // A final line cut short by the sniff boundary is not evidence: its bytes
-    // may simply continue past what was read.
-    if (newline === -1) return false
+  let start = 0
+  for (let newline = bytes.indexOf(0x0a); newline !== -1; newline = bytes.indexOf(0x0a, start)) {
     const line = bytes.subarray(start, newline)
     if (line.includes(0) && validUtf8Prefix(line) !== line.length) return true
     start = newline + 1
   }
-  return false
+
+  // Whatever follows the last newline is judged too -- a binary file often
+  // holds no newline at all in its opening bytes, and returning early on that
+  // would quietly disable the whole test. Its bytes may continue past the
+  // sniff, so the bar is higher: `validUtf8Prefix` already tolerates a scalar
+  // cut short at the boundary, and zero means genuinely invalid bytes.
+  const tail = bytes.subarray(start)
+  return tail.length > 0 && tail.includes(0) && validUtf8Prefix(tail) <= 0
 }
 
 /**

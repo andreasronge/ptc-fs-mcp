@@ -315,3 +315,42 @@ test('a line that both holds a NUL and fails to decode marks the file binary', a
     )
   })
 })
+
+test('a binary file with no newline in its opening bytes is still classified', async () => {
+  // The earlier fixtures all held a newline early, so a `return false` on the
+  // no-newline case passed them while disabling the test on real binaries,
+  // which frequently hold no 0x0a at all in their first 8 KiB.
+  const binary = Buffer.concat([Buffer.alloc(20_000, 0xc0), Buffer.from([0x00]), Buffer.from('needle\n')])
+
+  await withRoot({ 'blob.bin': binary, 'notes.txt': 'needle in text\n' }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
+      ['notes.txt'],
+    )
+  })
+})
+
+test('classification does not depend on how the pages happened to fall', async () => {
+  // The sniff used to shrink to whatever budget remained, so a file reached
+  // late in a page could be scanned unclassified and never re-examined.
+  const filler = `${'padding line that is quite long indeed\n'.repeat(200)}`
+  const binary = Buffer.concat([Buffer.alloc(20_000, 0xc0), Buffer.from([0x00])])
+  const tree = { 'a-filler.txt': filler, 'b-blob.bin': binary, 'c-notes.txt': 'needle in text\n' }
+
+  for (const extra of [[], ['--max-scan-bytes', '4096'], ['--max-scan-bytes', '9000']]) {
+    await withRoot(
+      tree,
+      async (server) => {
+        for (const limit of [1, 5, undefined]) {
+          const args = { query: 'needle', ...(limit === undefined ? {} : { limit }) }
+          assert.deepEqual(
+            (await collect(server, 'search_text', args)).map((match) => match.path),
+            ['c-notes.txt'],
+            `budget ${extra[1] ?? 'default'} limit ${limit}`,
+          )
+        }
+      },
+      ['--include', '**', ...extra],
+    )
+  }
+})
