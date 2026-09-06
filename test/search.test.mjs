@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { call, callFailing, collect, withFixture, withRoot } from './helpers/harness.mjs'
+import { call, callFailing, collect, startServer, withFixture, withRoot } from './helpers/harness.mjs'
 
 test('search_text reports the path and line number of a match', async () => {
   await withFixture(async (server) => {
@@ -286,7 +286,7 @@ test('the binary sniff obeys the scan budget rather than reading past it', async
         'a clamped sniff must still classify, and the traversal must still finish',
       )
     },
-    ['--include', '**', '--max-scan-bytes', '4096'],
+    ['--include', '**', '--max-scan-bytes', '8192'],
   )
 })
 
@@ -337,7 +337,7 @@ test('classification does not depend on how the pages happened to fall', async (
   const binary = Buffer.concat([Buffer.alloc(20_000, 0xc0), Buffer.from([0x00])])
   const tree = { 'a-filler.txt': filler, 'b-blob.bin': binary, 'c-notes.txt': 'needle in text\n' }
 
-  for (const extra of [[], ['--max-scan-bytes', '4096'], ['--max-scan-bytes', '9000']]) {
+  for (const extra of [[], ['--max-scan-bytes', '8192'], ['--max-scan-bytes', '9000']]) {
     await withRoot(
       tree,
       async (server) => {
@@ -353,4 +353,27 @@ test('classification does not depend on how the pages happened to fall', async (
       ['--include', '**', ...extra],
     )
   }
+})
+
+test('a short binary file with no trailing newline is classified', async () => {
+  // At end of file the last segment is a whole line, so it answers the same
+  // rule as one; treating it as possibly-truncated let `text\0\xff` through.
+  const binary = Buffer.from([0x74, 0x65, 0x78, 0x74, 0x00, 0xff])
+
+  await withRoot({ 'tiny.bin': binary, 'notes.txt': 'needle in text\n' }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'text' })).map((match) => match.path),
+      ['notes.txt'],
+    )
+  })
+})
+
+test('--max-scan-bytes may not be set below one binary sniff', async () => {
+  // A budget smaller than one sniff could not hold it, and the sniff is a
+  // fixed size so that classification does not depend on the page. Refusing
+  // the configuration is what keeps both of those true at once.
+  const server = startServer(['--root', process.cwd(), '--include', '**', '--max-scan-bytes', '4096'])
+  const code = await new Promise((resolve) => server.child.once('exit', resolve))
+  assert.equal(code, 64)
+  assert.match(server.stderr(), /limits are not valid/)
 })

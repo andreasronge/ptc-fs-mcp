@@ -37,6 +37,14 @@ export interface Limits {
   readonly maxWriteBytes: number
 }
 
+/**
+ * Opening bytes `search_text` samples to classify a file as binary.
+ *
+ * It is fixed rather than budget-relative so a file is classified the same way
+ * however the pages fell, which is why `maxScanBytes` may not be set below it:
+ * a smaller budget could not hold one sniff, and the sniff would overrun it.
+ */
+export const BINARY_SNIFF_BYTES = 8_192
 export const MAX_CONFIGURED_READ_BYTES = 1_048_576
 export const MAX_CONFIGURED_RESULT_BYTES = 1_048_576
 
@@ -459,7 +467,7 @@ function validateLimits(limits: Limits): void {
     !Number.isSafeInteger(limits.maxDepth) ||
     limits.maxDepth < 0 ||
     limits.maxReadBytes < 4 ||
-    limits.maxScanBytes < 4_096 ||
+    limits.maxScanBytes < BINARY_SNIFF_BYTES ||
     limits.maxReadBytes > MAX_CONFIGURED_READ_BYTES ||
     limits.maxResultBytes < DEFAULT_LIMITS.maxResultBytes ||
     limits.maxResultBytes > MAX_CONFIGURED_RESULT_BYTES

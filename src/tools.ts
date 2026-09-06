@@ -24,6 +24,7 @@ import { ConfigError, ToolError } from './errors.js'
 import { normalizeRelative } from './paths.js'
 import {
   assertOpenFileIdentity,
+  BINARY_SNIFF_BYTES,
   directoryListing,
   inventory,
   openFileForRead,
@@ -36,7 +37,6 @@ import {
 const MAX_PAGE = 200
 const READ_CHUNK_BYTES = 2_048
 const SEARCH_BUFFER_BYTES = 8_192
-const BINARY_SNIFF_BYTES = 8_192
 const MAX_QUERY_BYTES = 256
 const MAX_TERMS = 16
 const MAX_EVIDENCE_BYTES = 1_024
@@ -545,8 +545,12 @@ function scanText(
         // the cursor resumes at this same file with a full budget -- but only
         // once work has been done, so a page always makes progress.
         if (sniff > scanBudget - scanned && scanned > 0) break
-        if (isBinary(descriptor, sniff)) {
+        if (isBinary(descriptor, sniff, sniff === size)) {
           scanned += sniff
+          // The skip is still an observation of this file, so it answers to
+          // the same identity check the scanned path does: a file mutated
+          // under the sniff must reject rather than be silently passed over.
+          assertOpenFileIdentity(open)
           position = nextFile(position.file)
           continue
         }
@@ -627,7 +631,7 @@ function nextFile(file: number): SearchPosition {
  * `length` is clamped by the caller to what the scan budget still allows, so
  * the sniff cannot read past a ceiling the scan itself would have obeyed.
  */
-function isBinary(descriptor: number, length: number): boolean {
+function isBinary(descriptor: number, length: number, atEnd: boolean): boolean {
   if (length <= 0) return false
   const bytes = Buffer.allocUnsafe(length)
   if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
@@ -641,11 +645,14 @@ function isBinary(descriptor: number, length: number): boolean {
 
   // Whatever follows the last newline is judged too -- a binary file often
   // holds no newline at all in its opening bytes, and returning early on that
-  // would quietly disable the whole test. Its bytes may continue past the
-  // sniff, so the bar is higher: `validUtf8Prefix` already tolerates a scalar
-  // cut short at the boundary, and zero means genuinely invalid bytes.
+  // would quietly disable the whole test.
   const tail = bytes.subarray(start)
-  return tail.length > 0 && tail.includes(0) && validUtf8Prefix(tail) <= 0
+  if (tail.length === 0 || !tail.includes(0)) return false
+  // At end of file the tail is a whole line and answers the same rule as one.
+  // Short of that its bytes continue past the sniff, so the bar is higher:
+  // `validUtf8Prefix` tolerates a scalar cut short at the boundary, and zero
+  // means bytes that are invalid rather than merely clipped.
+  return atEnd ? validUtf8Prefix(tail) !== tail.length : validUtf8Prefix(tail) <= 0
 }
 
 /**
