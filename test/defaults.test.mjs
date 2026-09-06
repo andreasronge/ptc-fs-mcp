@@ -324,3 +324,14 @@ test('the file ceiling bounds listed directories, not only listed files', async 
     ['--include', '**', '--max-files', '3'],
   )
 })
+
+test('a listing charges the directories it walked through, as an inventory does', async () => {
+  await withRoot(
+    { 'a/b/c/x.txt': 'x\n' },
+    async (server) => {
+      assert.match(await callFailing(server, 'list_directory', { path: 'a/b' }), /directory limit exceeded/)
+      assert.match(await callFailing(server, 'search_files', { query: 'x' }), /directory limit exceeded/)
+    },
+    ['--include', '**', '--max-directories', '2'],
+  )
+})

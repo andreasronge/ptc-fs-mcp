@@ -289,3 +289,29 @@ test('the binary sniff obeys the scan budget rather than reading past it', async
     ['--include', '**', '--max-scan-bytes', '4096'],
   )
 })
+
+test('binary evidence must be co-located on one line, not spread over the file', async () => {
+  // A NUL on one line and a malformed byte on another is a text file with two
+  // odd lines, not a binary. Skipping it whole would discard `needle` for
+  // exactly the reason `evidence` exists to drop a single line instead.
+  const mixed = Buffer.concat([Buffer.from('needle here\n'), Buffer.from([0x00, 0x0a, 0xff, 0x0a])])
+
+  await withRoot({ 'mixed.txt': mixed }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.line),
+      [1],
+      'the good line survives lines that are individually odd',
+    )
+  })
+})
+
+test('a line that both holds a NUL and fails to decode marks the file binary', async () => {
+  const binary = Buffer.concat([Buffer.from([0x00, 0xff, 0xfe, 0x00, 0x0a]), Buffer.alloc(50_000, 0xc0)])
+
+  await withRoot({ 'blob.bin': binary, 'notes.txt': 'needle in text\n' }, async (server) => {
+    assert.deepEqual(
+      (await collect(server, 'search_text', { query: 'needle' })).map((match) => match.path),
+      ['notes.txt'],
+    )
+  })
+})

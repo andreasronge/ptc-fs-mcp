@@ -177,6 +177,11 @@ export function directoryListing(root: Root, prefix: string): Array<{ name: stri
   const directory = resolveDirectory(root, prefix)
   if (directory === null) return []
 
+  // The requested directory and every ancestor resolved to reach it are
+  // charged, so a listing counts what an inventory of the same prefix would.
+  counters.directories = depth + 1
+  if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
+
   let entries
   try {
     entries = opendirSync(directory)

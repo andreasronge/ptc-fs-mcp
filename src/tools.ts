@@ -607,7 +607,14 @@ function nextFile(file: number): SearchPosition {
 }
 
 /**
- * True when the opening `length` bytes both hold a NUL and fail to decode.
+ * True when the opening `length` bytes look like a binary file.
+ *
+ * The evidence must be co-located: a line that holds a NUL *and* does not
+ * decode. Taking the two signals file-wide instead would condemn a text file
+ * that happens to hold a NUL somewhere and one malformed line somewhere else,
+ * discarding the good lines between them -- and skipping a whole file for
+ * what `evidence` is supposed to drop one line at a time is the failure this
+ * rule exists to avoid, not to commit at larger scale.
  *
  * `length` is clamped by the caller to what the scan budget still allows, so
  * the sniff cannot read past a ceiling the scan itself would have obeyed.
@@ -616,9 +623,17 @@ function isBinary(descriptor: number, length: number): boolean {
   if (length <= 0) return false
   const bytes = Buffer.allocUnsafe(length)
   if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
-  // `validUtf8Prefix` allows a sniff that stops mid-scalar, so a cut-short
-  // multi-byte character at the 8 KiB boundary is not mistaken for evidence.
-  return bytes.includes(0) && validUtf8Prefix(bytes) <= 0
+
+  for (let start = 0; start < bytes.length; ) {
+    const newline = bytes.indexOf(0x0a, start)
+    // A final line cut short by the sniff boundary is not evidence: its bytes
+    // may simply continue past what was read.
+    if (newline === -1) return false
+    const line = bytes.subarray(start, newline)
+    if (line.includes(0) && validUtf8Prefix(line) !== line.length) return true
+    start = newline + 1
+  }
+  return false
 }
 
 /**

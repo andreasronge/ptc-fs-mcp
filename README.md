@@ -245,17 +245,20 @@ reason -- splitting on a bare pipe would quietly change the meaning of every
 search for text that contains one, and `string | number` is ordinary source.
 A cursor is bound to the exact terms and folding it was issued for.
 
-`search_text` skips a file whole when its opening bytes both contain a NUL and
-fail to decode as UTF-8. Either signal alone discards real text: NUL is itself
-valid UTF-8, and a text file holding one malformed line is meant to lose that
-line rather than the file. Together they identify the compiled artifacts and
-dumps whose every line would be dropped anyway. Listings stay content-blind,
+`search_text` skips a file whole when one line in its opening bytes both
+contains a NUL and fails to decode as UTF-8. Each part of that is load-bearing.
+Either signal alone discards real text -- NUL is itself valid UTF-8, and a text
+file holding one malformed line is meant to lose that line rather than the
+file -- and the two must fall on the same line, or a text file with a NUL in
+one place and a bad byte in another would be condemned by the combination.
+What is left identifies the compiled artifacts and dumps whose every line would
+be dropped anyway: on one real checkout, 146 MB of the 374 MB served. Listings stay content-blind,
 and `read_text_file` still refuses the same file with `file is not valid
 UTF-8`.
 
-That decision is made from the opening 8 KiB, so it can be wrong in one
-direction worth naming: a file that begins with a binary header and holds real
-text further in is skipped whole, and its matches are not reported. Every tool
+That decision is still made from the opening 8 KiB, so it can be wrong in one
+direction worth naming: a file whose first lines look binary but which holds
+real text further in is skipped whole, and its matches are not reported. Every tool
 that classifies files this way shares the limitation; the trade is against
 spending a page budget proving a compiled artifact holds nothing, which on one
 real checkout was half the bytes served. Where a root holds such files and
