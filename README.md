@@ -270,20 +270,51 @@ when it holds at least one served file at any depth, and each probe stops at
 the first one it finds, so listing one level costs a probe per child rather
 than an inventory of everything beneath it.
 
+### Reading part of a large file
+
+`read_text_file` pages from the start of a file by default. `start_line` begins
+at a 1-based line instead, which is what makes a large CSV or log navigable: a
+slice at row 4,000 costs one page rather than the 3,999 rows before it crossing
+the result budget first. `byte_offset` stays absolute, so a line-addressed read
+is still citable against the whole file, and a cursor is bound to the
+`start_line` it was issued for.
+
+There is no line index to seek with, so locating a line counts newlines from
+the start. That happens only on the page with no cursor to resume from -- every
+later page reads its offset out of the cursor -- and it is charged against
+`--max-scan-bytes`, so an absurd line number fails with an actionable error
+rather than reading without limit.
+
+Nothing above understands CSV. Deliberately: quoting, embedded newlines,
+delimiters, and headers are shaping decisions that belong wherever the rows are
+consumed, and a second parser here would only disagree with that one in corner
+cases. This server narrows bytes; the consumer gives them meaning. Reading the
+header is one call and the rows another, which is all a parser needs.
+
 ### Text that is not UTF-8
 
 This is a UTF-8 text server, and two consequences are worth stating rather than
-discovering. `read_text_file` refuses a file that is not valid UTF-8, which
-includes a CSV exported as cp1252 or latin-1 -- still a common shape for
-spreadsheet output. `search_text` skips a line it cannot decode, so a search
-over a mixed-encoding tree reports matches only from the files that decode, and
-reports nothing about the ones that did not. Transcode at the source if a root
-holds legacy encodings.
+discovering.
 
-A UTF-8 byte-order mark is content, not metadata, here: `read_text_file`
+`read_text_file` refuses a file that is not valid UTF-8, which includes a CSV
+exported as cp1252 or latin-1 -- still a common shape for spreadsheet output.
+`search_text` skips a line it cannot decode, so a search over a mixed-encoding
+tree reports matches only from the files that decode, and says nothing about
+the ones that did not. That silence is the sharp edge: transcode at the source
+if a root holds legacy encodings. Serving them here would mean `content_hash`
+naming bytes that were never on disk, which is the one thing a citation may not
+do.
+
+A UTF-8 byte-order mark is content, not metadata, here. `read_text_file`
 returns the bytes exactly as they are, so a BOM arrives as a leading `\uFEFF`
-and a naive CSV parse will carry it into the first column name. Strip it in the
-consumer; the server does not, because concatenated pages reconstruct the file
+and a naive parse carries it into the first column name. Stripping it is one
+expression in the consumer:
+
+```clojure
+(if (starts-with? raw "\uFEFF") (subs raw 1) raw)
+```
+
+The server does not, because concatenated pages must reconstruct the file
 exactly and `content_hash` names the bytes actually served.
 
 ### Spawning without an inherited environment

@@ -253,7 +253,9 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'read_text_file',
     {
       title: 'Read text file',
-      description: 'Bounded exact UTF-8 chunks of live bytes. Concatenate item text and follow next_cursor.',
+      description:
+        'Bounded exact UTF-8 chunks of live bytes. Concatenate item text and follow next_cursor. Pass start_line ' +
+        'to begin at a 1-based line instead of the start of the file.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(
@@ -263,6 +265,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           path: { type: 'string', minLength: 1 },
+          start_line: { type: 'integer', minimum: 1 },
           cursor: { type: 'string' },
           limit: {
             type: 'integer',
@@ -277,14 +280,27 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     async (args: Record<string, unknown>) => {
       const path = requirePath(args.path, 'path')
       if (path === '') throw new ToolError('path must name a file')
+      const startLine = requireLine(args.start_line)
       const file = openFileForRead(root, path)
       try {
-        const scope = scopeOf('read_text_file', { path })
+        // `undefined` drops out of the digested arguments, so a call without
+        // start_line keeps the scope every earlier cursor was issued against.
+        const scope = scopeOf('read_text_file', {
+          path,
+          ...(startLine === undefined ? {} : { start_line: startLine }),
+        })
         const semanticIdentity = deterministic
           ? `${file.bytes}:${contentDigest(file, { remaining: maxCursorHashBytes }, digestCache, root.limits.maxFiles)}`
           : file.identity
         const state = stateOf([semanticIdentity])
-        const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
+        // Locating a line means counting newlines from the start, so it is done
+        // only for the page that has no cursor to resume from. Every later page
+        // reads its byte offset straight out of the cursor.
+        const first =
+          args.cursor !== undefined || startLine === undefined
+            ? 0
+            : byteOfLine(file.descriptor, file.bytes, startLine, root.limits.maxScanBytes)
+        const offset = cursors.decode(scope, state, args.cursor, isOffset, first)
         const maxChunks = Math.ceil(root.limits.maxReadBytes / READ_CHUNK_BYTES)
         const limit = boundedPage(args.limit, maxChunks)
         const page = readPage(
@@ -839,6 +855,46 @@ function requireFlag(value: unknown, field: string): boolean {
   if (value === undefined) return false
   if (typeof value !== 'boolean') throw new ToolError(`${field} must be a boolean`)
   return value
+}
+
+function requireLine(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new ToolError('start_line must be a positive integer')
+  }
+  return value
+}
+
+/**
+ * The byte offset where 1-based `line` begins, or the file size when the file
+ * has fewer lines than that.
+ *
+ * There is no index to seek with, so this counts newlines from the start. It
+ * is still far cheaper than the alternative, which is shipping every preceding
+ * byte through a result budget to let the caller count them; and the scan is
+ * charged against the same ceiling a search page obeys, so an absurd line
+ * number on a huge file fails with something actionable rather than reading
+ * without limit.
+ */
+function byteOfLine(descriptor: number, size: number, line: number, budget: number): number {
+  if (line === 1) return 0
+  let position = 0
+  let remaining = line - 1
+  const buffer = Buffer.allocUnsafe(SEARCH_BUFFER_BYTES)
+
+  while (position < size) {
+    if (position >= budget) throw new ToolError('start_line is further into the file than one page may scan')
+    const wanted = Math.min(buffer.length, size - position)
+    const count = readSync(descriptor, buffer, 0, wanted, position)
+    if (count <= 0) throw new ToolError('read failed')
+
+    for (let index = 0; index < count; index += 1) {
+      position += 1
+      if (buffer[index] === 0x0a && (remaining -= 1) === 0) return position
+    }
+  }
+
+  return size
 }
 
 function requireQuery(value: unknown): string {
