@@ -151,3 +151,86 @@ test('the fixture is unchanged by a full read-only session', async () => {
     assert.equal(alpha.map((chunk) => chunk.text).join(''), FIXTURE['lib/alpha.ex'])
   })
 })
+
+test('a symlinked directory cannot be listed by naming it as a prefix', async () => {
+  // The walk skips symlinks as it descends, but a prefix names a directory to
+  // open directly, so every component of it is checked before that open.
+  await withRoot({ 'real/keep.txt': 'served\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    const listed = await call(server, 'list_directory', { path: 'link' })
+    assert.deepEqual(listed.items, [], 'a link must not become a window out of the root')
+
+    const top = await call(server, 'list_directory', { path: '' })
+    assert.deepEqual(
+      top.items.map((entry) => entry.name),
+      ['real'],
+      'and the link itself is not listed either',
+    )
+  })
+})
+
+test('a symlinked ancestor cannot be read through', async () => {
+  // O_NOFOLLOW guards the name it opens, so an intermediate link would
+  // otherwise be followed by the kernel before that flag ever applied.
+  await withRoot({ 'real/keep.txt': 'served\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    assert.match(
+      await callFailing(server, 'read_text_file', { path: 'link/anything.txt' }),
+      /not served by this root/,
+    )
+  })
+})
+
+test('a search scoped to a symlinked prefix finds nothing', async () => {
+  await withRoot({ 'real/keep.txt': 'needle\n', link: { symlink: '../../outside.txt' } }, async (server) => {
+    const page = await call(server, 'search_text', { query: 'needle', path: 'link' })
+    assert.deepEqual(page.items, [])
+  })
+})
+
+test('an excluded directory cannot be reached by naming it directly', async () => {
+  // The walk prunes at the excluded directory, so it never sees what is
+  // under it. Naming a path skips that descent, and `--exclude secret`
+  // plainly means the files under it too.
+  await withRoot(
+    { 'secret/creds.txt': 'classified\n', 'app.txt': 'served\n' },
+    async (server) => {
+      assert.deepEqual((await call(server, 'list_directory', { path: 'secret' })).items, [])
+      assert.match(await callFailing(server, 'read_text_file', { path: 'secret/creds.txt' }), /--exclude pattern/)
+      assert.deepEqual((await call(server, 'search_text', { query: 'classified', path: 'secret' })).items, [])
+      assert.deepEqual(
+        (await collect(server, 'search_text', { query: 'served' })).map((match) => match.path),
+        ['app.txt'],
+      )
+    },
+    ['--include', '**', '--exclude', 'secret'],
+  )
+})
+
+test('an exclude deep in the tree still covers everything under it', async () => {
+  await withRoot(
+    { 'a/b/hide/x.txt': 'hidden\n', 'a/b/keep/y.txt': 'kept\n' },
+    async (server) => {
+      assert.match(await callFailing(server, 'read_text_file', { path: 'a/b/hide/x.txt' }), /--exclude pattern/)
+      assert.deepEqual(
+        (await call(server, 'list_directory', { path: 'a/b' })).items.map((e) => e.name),
+        ['keep'],
+      )
+    },
+    ['--include', '**', '--exclude', 'a/b/hide'],
+  )
+})
+
+test('a filesystem error on a path component never carries the host path', async () => {
+  // `throwIfNoEntry: false` suppresses only ENOENT; an over-long component
+  // still throws, and the message Node builds names the absolute path.
+  const overLong = 'n'.repeat(300)
+
+  await withRoot({ 'a.txt': 'x\n' }, async (server) => {
+    // A component that cannot be stat-ed is a directory this root does not
+    // serve, which reads the same as one that is not there.
+    assert.deepEqual((await call(server, 'list_directory', { path: overLong })).items, [])
+
+    const message = await callFailing(server, 'read_text_file', { path: `${overLong}/f.txt` })
+    assert.match(message, /not served by this root/)
+    assert.doesNotMatch(message, /ENAMETOOLONG|lstat|\/private\/|\/tmp\//)
+  })
+})

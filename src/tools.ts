@@ -24,6 +24,8 @@ import { ConfigError, ToolError } from './errors.js'
 import { normalizeRelative } from './paths.js'
 import {
   assertOpenFileIdentity,
+  BINARY_SNIFF_BYTES,
+  directoryListing,
   inventory,
   openFileForRead,
   writeTextFile,
@@ -35,8 +37,8 @@ import {
 const MAX_PAGE = 200
 const READ_CHUNK_BYTES = 2_048
 const SEARCH_BUFFER_BYTES = 8_192
-const SEARCH_SCAN_BYTES = 262_144
 const MAX_QUERY_BYTES = 256
+const MAX_TERMS = 16
 const MAX_EVIDENCE_BYTES = 1_024
 const SIZING_HASH = `sha256:${'0'.repeat(64)}`
 
@@ -128,7 +130,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     },
     async (args: Record<string, unknown>) => {
       const prefix = args.path === undefined ? '' : requirePath(args.path, 'path')
-      const items = directoryEntries(root, prefix)
+      const items = directoryListing(root, prefix)
       const scope = scopeOf('list_directory', { path: prefix })
       const state = stateOf(items.map((entry) => `${entry.kind}\0${entry.path}`))
       const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
@@ -145,7 +147,9 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'search_files',
     {
       title: 'Search files',
-      description: 'Sorted paths containing a literal substring. Follow next_cursor until null.',
+      description:
+        'Sorted paths containing a literal substring. Pass any_of instead of query to match any of several ' +
+        'substrings, and case_insensitive to fold ASCII letters. Follow next_cursor until null.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(pagedOutput({ path: { type: 'string' } })),
@@ -153,19 +157,29 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           query: { type: 'string', minLength: 1 },
+          any_of: {
+            type: 'array',
+            items: { type: 'string', minLength: 1 },
+            minItems: 1,
+            maxItems: MAX_TERMS,
+          },
+          case_insensitive: { type: 'boolean' },
           cursor: { type: 'string' },
           limit: { type: 'integer', minimum: 1 },
         },
-        required: ['query'],
         additionalProperties: false,
       }),
     },
     async (args: Record<string, unknown>) => {
-      const query = requireQuery(args.query)
+      const terms = requireTerms(args)
+      const needles = terms.values.map((term) => (terms.caseInsensitive ? foldString(term) : term))
       const paths = inventory(root)
         .map((file) => file.path)
-        .filter((path) => path.includes(query))
-      const scope = scopeOf('search_files', { query })
+        .filter((path) => {
+          const candidate = terms.caseInsensitive ? foldString(path) : path
+          return needles.some((needle) => candidate.includes(needle))
+        })
+      const scope = scopeOf('search_files', { terms: terms.values, caseInsensitive: terms.caseInsensitive })
       const state = stateOf(paths)
       const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
       const candidates = paths.map((path, index) => ({
@@ -181,7 +195,9 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'search_text',
     {
       title: 'Search text',
-      description: 'Streaming literal line search. Empty progress pages may carry next_cursor; follow it until null.',
+      description:
+        'Streaming literal line search. Pass any_of instead of query to match any of several substrings, and ' +
+        'case_insensitive to fold ASCII letters. Empty progress pages may carry next_cursor; follow it until null.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(
@@ -191,19 +207,29 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           query: { type: 'string', minLength: 1 },
+          any_of: {
+            type: 'array',
+            items: { type: 'string', minLength: 1 },
+            minItems: 1,
+            maxItems: MAX_TERMS,
+          },
+          case_insensitive: { type: 'boolean' },
           path: { type: 'string' },
           cursor: { type: 'string' },
           limit: { type: 'integer', minimum: 1 },
         },
-        required: ['query'],
         additionalProperties: false,
       }),
     },
     async (args: Record<string, unknown>) => {
-      const query = requireQuery(args.query)
+      const terms = requireTerms(args)
       const prefix = args.path === undefined ? '' : requirePath(args.path, 'path')
       const files = inventory(root, prefix)
-      const scope = scopeOf('search_text', { path: prefix, query })
+      const scope = scopeOf('search_text', {
+        path: prefix,
+        terms: terms.values,
+        caseInsensitive: terms.caseInsensitive,
+      })
       // Content is what a text search tears on. Default mode binds physical
       // observations; deterministic mode binds semantic content identities.
       const stateFiles = deterministic
@@ -218,7 +244,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         (value): value is SearchPosition => isSearchPosition(value, files.length),
         first,
       )
-      const scan = scanText(root, files, query, start, boundedPage(args.limit), deterministic)
+      const scan = scanText(root, files, terms, start, boundedPage(args.limit), deterministic)
       return structured(pageValue(cursors, scope, state, start, scan.candidates, scan.next, resultBudget))
     },
   )
@@ -227,7 +253,10 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     'read_text_file',
     {
       title: 'Read text file',
-      description: 'Bounded exact UTF-8 chunks of live bytes. Concatenate item text and follow next_cursor.',
+      description:
+        'Bounded exact UTF-8 chunks of live bytes. Concatenate item text and follow next_cursor. Pass start_line ' +
+        'to begin at a 1-based line instead of the start of the file; only the bytes actually returned must ' +
+        'decode as UTF-8.',
       annotations: readOnly,
       _meta: meta,
       outputSchema: fromJsonSchema<Record<string, unknown>>(
@@ -237,6 +266,7 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
         type: 'object',
         properties: {
           path: { type: 'string', minLength: 1 },
+          start_line: { type: 'integer', minimum: 1 },
           cursor: { type: 'string' },
           limit: {
             type: 'integer',
@@ -251,14 +281,27 @@ export function createServer(root: Root, identity: ServerIdentity, options: Serv
     async (args: Record<string, unknown>) => {
       const path = requirePath(args.path, 'path')
       if (path === '') throw new ToolError('path must name a file')
+      const startLine = requireLine(args.start_line)
       const file = openFileForRead(root, path)
       try {
-        const scope = scopeOf('read_text_file', { path })
+        // `undefined` drops out of the digested arguments, so a call without
+        // start_line keeps the scope every earlier cursor was issued against.
+        const scope = scopeOf('read_text_file', {
+          path,
+          ...(startLine === undefined ? {} : { start_line: startLine }),
+        })
         const semanticIdentity = deterministic
           ? `${file.bytes}:${contentDigest(file, { remaining: maxCursorHashBytes }, digestCache, root.limits.maxFiles)}`
           : file.identity
         const state = stateOf([semanticIdentity])
-        const offset = cursors.decode(scope, state, args.cursor, isOffset, 0)
+        // Locating a line means counting newlines from the start, so it is done
+        // only for the page that has no cursor to resume from. Every later page
+        // reads its byte offset straight out of the cursor.
+        const first =
+          args.cursor !== undefined || startLine === undefined
+            ? 0
+            : byteOfLine(file.descriptor, file.bytes, startLine, root.limits.maxScanBytes)
+        const offset = cursors.decode(scope, state, args.cursor, isOffset, first)
         const maxChunks = Math.ceil(root.limits.maxReadBytes / READ_CHUNK_BYTES)
         const limit = boundedPage(args.limit, maxChunks)
         const page = readPage(
@@ -387,23 +430,6 @@ function contentDigest(
  * access model: a directory appears only because it holds something served,
  * so an unserved directory's name never leaks through a listing.
  */
-function directoryEntries(root: Root, prefix: string): Array<{ name: string; kind: string; path: string }> {
-  const scope = prefix === '' ? '' : `${prefix}/`
-  const entries = new Map<string, 'file' | 'directory'>()
-
-  for (const file of inventory(root, prefix)) {
-    const remainder = file.path.slice(scope.length)
-    if (remainder === '') continue
-    const separator = remainder.indexOf('/')
-    if (separator === -1) entries.set(remainder, 'file')
-    else entries.set(remainder.slice(0, separator), 'directory')
-  }
-
-  return [...entries.entries()]
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([name, kind]) => ({ name, kind, path: scope + name }))
-}
-
 function readPage(
   cursors: CursorCodec,
   descriptor: number,
@@ -457,13 +483,17 @@ function readPage(
 function scanText(
   root: Root,
   files: readonly FileFact[],
-  query: string,
+  terms: Terms,
   start: SearchPosition,
   limit: number,
   failOnObservationChange: boolean,
 ) {
-  const queryBytes = Buffer.from(query, 'utf8')
-  const failure = kmpFailure(queryBytes)
+  // One KMP machine per needle, all advanced over the same byte. A line
+  // matches when any of them completes, so the cursor's single `matched` flag
+  // keeps its meaning however many terms were asked for.
+  const scanBudget = root.limits.maxScanBytes
+  const patterns = compileTerms(terms)
+  const longest = patterns.reduce((widest, pattern) => Math.max(widest, pattern.bytes.length), 0)
   const candidates: Array<Candidate<{ path: string; line: number; text: string }>> = []
   let position = { ...start }
   let scanned = 0
@@ -478,7 +508,7 @@ function scanText(
     })
   }
 
-  while (position.file < files.length && candidates.length < limit && scanned < SEARCH_SCAN_BYTES) {
+  while (position.file < files.length && candidates.length < limit && scanned < scanBudget) {
     const file = files[position.file]!
     let open
     try {
@@ -498,11 +528,44 @@ function scanText(
       if (position.offset > size || position.lineStart > position.offset) {
         throw new ToolError('cursor position is not valid')
       }
-      let matchState = restoreMatchState(descriptor, position, queryBytes, failure)
+      // A file is skipped whole only when both binary signals agree: its
+      // opening bytes hold a NUL and they do not decode as UTF-8. Either test
+      // alone drops real text. NUL is itself valid UTF-8, so the usual NUL
+      // heuristic would have silently discarded 34 MB of genuine text on one
+      // real checkout; and undecodability alone would discard a text file
+      // holding a single malformed line, which `evidence` is supposed to skip
+      // one line at a time. Together they still skip the compiled artifacts
+      // and dumps that made searching a real root cost a hundred empty pages.
+      // The sniff is charged to the scan budget, and on a file that is text it
+      // reads the same bytes the scan would have read first.
+      if (position.offset === 0) {
+        const sniff = Math.min(BINARY_SNIFF_BYTES, size)
+        // The sniff is a fixed size rather than whatever the budget has left,
+        // so a file is classified the same way however the pages happened to
+        // fall. When the remainder cannot cover it, this page stops here and
+        // the cursor resumes at this same file with a full budget -- but only
+        // once work has been done, so a page always makes progress.
+        if (sniff > scanBudget - scanned && scanned > 0) break
+        const binary = isBinary(descriptor, sniff, sniff === size)
+        // Charged either way. The scanner re-reads these bytes on the text
+        // path, and a budget that counted them once would bound half the I/O
+        // it claims to. The floor is two sniffs, so a page can always scan
+        // after paying for one.
+        scanned += sniff
+        if (binary) {
+          // The skip is still an observation of this file, so it answers to
+          // the same identity check the scanned path does: a file mutated
+          // under the sniff must reject rather than be silently passed over.
+          assertOpenFileIdentity(open)
+          position = nextFile(position.file)
+          continue
+        }
+      }
+      const states = restoreMatchStates(descriptor, position, patterns, longest, terms.caseInsensitive)
       const buffer = Buffer.allocUnsafe(Math.min(SEARCH_BUFFER_BYTES, Math.max(size - position.offset, 1)))
 
-      while (position.offset < size && candidates.length < limit && scanned < SEARCH_SCAN_BYTES) {
-        const wanted = Math.min(buffer.length, size - position.offset, SEARCH_SCAN_BYTES - scanned)
+      while (position.offset < size && candidates.length < limit && scanned < scanBudget) {
+        const wanted = Math.min(buffer.length, size - position.offset, scanBudget - scanned)
         const count = readSync(descriptor, buffer, 0, wanted, position.offset)
         if (count <= 0) throw new ToolError('read failed')
 
@@ -523,15 +586,20 @@ function scanText(
             position.lineStart = position.offset
             position.line += 1
             position.matched = false
-            matchState = 0
+            states.fill(0)
             if (candidates.length >= limit) break
             continue
           }
 
-          matchState = kmpStep(queryBytes, failure, matchState, byte)
-          if (matchState === queryBytes.length) {
-            position.matched = true
-            matchState = failure[matchState - 1] ?? 0
+          const probe = terms.caseInsensitive ? foldByte(byte) : byte
+          for (let term = 0; term < patterns.length; term += 1) {
+            const { bytes: termBytes, failure } = patterns[term]!
+            let state = kmpStep(termBytes, failure, states[term]!, probe)
+            if (state === termBytes.length) {
+              position.matched = true
+              state = failure[state - 1] ?? 0
+            }
+            states[term] = state
           }
         }
       }
@@ -556,25 +624,98 @@ function nextFile(file: number): SearchPosition {
   return { file: file + 1, offset: 0, lineStart: 0, line: 1, matched: false }
 }
 
-/** Replays the current line's tail so a resumed scan cannot miss a straddling match. */
-function restoreMatchState(
+/**
+ * True when the opening `length` bytes look like a binary file.
+ *
+ * The evidence must be co-located: a line that holds a NUL *and* does not
+ * decode. Taking the two signals file-wide instead would condemn a text file
+ * that happens to hold a NUL somewhere and one malformed line somewhere else,
+ * discarding the good lines between them -- and skipping a whole file for
+ * what `evidence` is supposed to drop one line at a time is the failure this
+ * rule exists to avoid, not to commit at larger scale.
+ *
+ * `length` is clamped by the caller to what the scan budget still allows, so
+ * the sniff cannot read past a ceiling the scan itself would have obeyed.
+ */
+function isBinary(descriptor: number, length: number, atEnd: boolean): boolean {
+  if (length <= 0) return false
+  const bytes = Buffer.allocUnsafe(length)
+  if (readSync(descriptor, bytes, 0, length, 0) !== length) throw new ToolError('read failed')
+
+  let start = 0
+  for (let newline = bytes.indexOf(0x0a); newline !== -1; newline = bytes.indexOf(0x0a, start)) {
+    const line = bytes.subarray(start, newline)
+    if (line.includes(0) && validUtf8Prefix(line) !== line.length) return true
+    start = newline + 1
+  }
+
+  // Whatever follows the last newline is judged too -- a binary file often
+  // holds no newline at all in its opening bytes, and returning early on that
+  // would quietly disable the whole test.
+  const tail = bytes.subarray(start)
+  if (tail.length === 0 || !tail.includes(0)) return false
+  // At end of file the tail is a whole line and answers the same rule as one.
+  const valid = validUtf8Prefix(tail)
+  if (atEnd) return valid !== tail.length
+  // Short of end of file the tail continues past the sniff, so invalidity in
+  // its last bytes might only be a scalar the boundary cut in half. Might:
+  // those bytes are excused only when they are genuinely the beginning of one
+  // and nothing more.
+  return valid <= 0 || !isIncompleteScalar(tail.subarray(valid))
+}
+
+/**
+ * True when `suffix` is the start of a UTF-8 scalar and nothing else -- a
+ * sequence the sniff boundary could have cut in half.
+ *
+ * Both halves matter. A lead byte alone is not enough: `0xC2` followed by `A`
+ * announces a two-byte scalar and then fails to deliver one, which is malformed
+ * however many bytes follow. And the sequence must still be short of its own
+ * length, or it is complete and its invalidity is its own.
+ */
+function isIncompleteScalar(suffix: Buffer): boolean {
+  const lead = suffix[0]
+  if (lead === undefined) return false
+
+  const expected = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc2 ? 2 : 0
+  if (expected === 0 || lead > 0xf4 || suffix.length >= expected) return false
+
+  for (let index = 1; index < suffix.length; index += 1) {
+    const byte = suffix[index]!
+    if (byte < 0x80 || byte > 0xbf) return false
+  }
+  return true
+}
+
+/**
+ * Replays the current line's tail so a resumed scan cannot miss a straddling
+ * match. The replay is as long as the widest needle, so every machine sees
+ * enough history regardless of which one eventually matches.
+ */
+function restoreMatchStates(
   descriptor: number,
   position: SearchPosition,
-  query: Buffer,
-  failure: readonly number[],
-): number {
-  const overlap = Math.min(query.length - 1, position.offset - position.lineStart)
-  if (overlap <= 0) return 0
+  patterns: readonly CompiledTerm[],
+  longest: number,
+  caseInsensitive: boolean,
+): number[] {
+  const states = patterns.map(() => 0)
+  const overlap = Math.min(longest - 1, position.offset - position.lineStart)
+  if (overlap <= 0) return states
   const bytes = Buffer.allocUnsafe(overlap)
   if (readSync(descriptor, bytes, 0, overlap, position.offset - overlap) !== overlap) {
     throw new ToolError('read failed')
   }
-  let state = 0
   for (const byte of bytes) {
-    state = kmpStep(query, failure, state, byte)
-    if (state === query.length) state = failure[state - 1] ?? 0
+    const probe = caseInsensitive ? foldByte(byte) : byte
+    for (let term = 0; term < patterns.length; term += 1) {
+      const { bytes: termBytes, failure } = patterns[term]!
+      let state = kmpStep(termBytes, failure, states[term]!, probe)
+      if (state === termBytes.length) state = failure[state - 1] ?? 0
+      states[term] = state
+    }
   }
-  return state
+  return states
 }
 
 /** The matched line, or null when its bytes are not valid UTF-8. */
@@ -725,6 +866,111 @@ function requirePath(value: unknown, field: string): string {
   const normalized = normalizeRelative(value)
   if (normalized === null) throw new ToolError(`${field} is not a relative path inside the root`)
   return normalized
+}
+
+/** One or more literal needles, and how their bytes are compared. */
+interface Terms {
+  readonly values: readonly string[]
+  readonly caseInsensitive: boolean
+}
+
+interface CompiledTerm {
+  readonly bytes: Buffer
+  readonly failure: readonly number[]
+}
+
+/**
+ * ASCII-only case folding.
+ *
+ * Deliberately not Unicode: the scanner is byte-oriented, and full case
+ * folding is neither byte-local nor length-preserving, so it cannot be done
+ * correctly one byte at a time. Folding A-Z is a rule that holds exactly, is
+ * the same on every platform, and covers what identifiers are made of.
+ */
+function foldByte(byte: number): number {
+  return byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte
+}
+
+function foldString(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 0x20))
+}
+
+function compileTerms(terms: Terms): CompiledTerm[] {
+  return terms.values.map((term) => {
+    const bytes = Buffer.from(terms.caseInsensitive ? foldString(term) : term, 'utf8')
+    return { bytes, failure: kmpFailure(bytes) }
+  })
+}
+
+/**
+ * Reads the needles for a search: exactly one of `query` or `any_of`.
+ *
+ * `any_of` is a list rather than a `|` inside `query` on purpose. Splitting a
+ * query on a bare pipe would silently change the meaning of every literal
+ * search containing one -- `string | number` is ordinary source text -- and a
+ * search that quietly matches more than it was asked to is the failure this
+ * server spends errors to avoid.
+ */
+function requireTerms(args: Record<string, unknown>): Terms {
+  if (args.query !== undefined && args.any_of !== undefined) {
+    throw new ToolError('pass either query or any_of, not both')
+  }
+  const values = args.any_of === undefined ? [requireQuery(args.query)] : requireAnyOf(args.any_of)
+  return { values, caseInsensitive: requireFlag(args.case_insensitive, 'case_insensitive') }
+}
+
+function requireAnyOf(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ToolError('any_of must be a non-empty array of strings')
+  }
+  if (value.length > MAX_TERMS) throw new ToolError(`any_of accepts at most ${MAX_TERMS} terms`)
+  return value.map((term) => requireQuery(term))
+}
+
+function requireFlag(value: unknown, field: string): boolean {
+  if (value === undefined) return false
+  if (typeof value !== 'boolean') throw new ToolError(`${field} must be a boolean`)
+  return value
+}
+
+function requireLine(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new ToolError('start_line must be a positive integer')
+  }
+  return value
+}
+
+/**
+ * The byte offset where 1-based `line` begins, or the file size when the file
+ * has fewer lines than that.
+ *
+ * There is no index to seek with, so this counts newlines from the start. It
+ * is still far cheaper than the alternative, which is shipping every preceding
+ * byte through a result budget to let the caller count them; and the scan is
+ * charged against the same ceiling a search page obeys, so an absurd line
+ * number on a huge file fails with something actionable rather than reading
+ * without limit.
+ */
+function byteOfLine(descriptor: number, size: number, line: number, budget: number): number {
+  if (line === 1) return 0
+  let position = 0
+  let remaining = line - 1
+  const buffer = Buffer.allocUnsafe(SEARCH_BUFFER_BYTES)
+
+  while (position < size) {
+    if (position >= budget) throw new ToolError('start_line is further into the file than one page may scan')
+    const wanted = Math.min(buffer.length, size - position, budget - position)
+    const count = readSync(descriptor, buffer, 0, wanted, position)
+    if (count <= 0) throw new ToolError('read failed')
+
+    for (let index = 0; index < count; index += 1) {
+      position += 1
+      if (buffer[index] === 0x0a && (remaining -= 1) === 0) return position
+    }
+  }
+
+  return size
 }
 
 function requireQuery(value: unknown): string {

@@ -13,10 +13,13 @@ const MAX_PATH_LENGTH = 1_024
  * string is not a relative path inside a confined root.
  *
  * Absolute paths, `.`/`..` segments, NUL bytes, backslashes, and Windows drive
- * prefixes are all rejected. The empty string normalizes to the root itself.
+ * prefixes are all rejected. The empty string normalizes to the root itself,
+ * and so does a bare `.` -- the universal idiom for "here", and the first
+ * thing a client reaches for. Only that exact string is accepted: `./lib` and
+ * `lib/.` still carry a `.` segment and are still rejected.
  */
 export function normalizeRelative(value: string): string | null {
-  if (value === '') return ''
+  if (value === '' || value === '.') return ''
   if (value.includes('\0') || value.startsWith('/') || value.includes('\\')) return null
   if (value.length > MAX_PATH_LENGTH || /^[a-zA-Z]:/.test(value)) return null
 
@@ -36,8 +39,11 @@ export function posixJoin(prefix: string, name: string): string {
  * `*` matches within a segment, `**` crosses segments, and a trailing slash
  * after `**` additionally matches zero directories, so `lib/**` selects
  * `lib/a.ts` as well as `lib/deep/a.ts`. Every other character is literal.
+ *
+ * `flags` is passed to the compiled expression, so a caller that must match
+ * regardless of case can ask for it.
  */
-export function compileGlob(pattern: string): RegExp {
+export function compileGlob(pattern: string, flags = ''): RegExp {
   let source = '^'
   for (let index = 0; index < pattern.length; index += 1) {
     const character = pattern[index]!
@@ -57,7 +63,7 @@ export function compileGlob(pattern: string): RegExp {
     }
     source += character.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   }
-  return new RegExp(`${source}$`)
+  return new RegExp(`${source}$`, flags)
 }
 
 /**
@@ -73,12 +79,92 @@ export function matchesRootLevel(pattern: string): boolean {
   return !pattern.split('**/').join('').includes('/')
 }
 
+/**
+ * Directories that hold dependency or tool output rather than the material a
+ * client came for. A walk that inventories them spends its budget on them and
+ * can return empty pages while a real match waits behind them.
+ *
+ * Every name here is one no person picks for their own data. That rule is
+ * doing real work: `build`, `dist`, `target`, `coverage`, and `cover` are all
+ * output directories in some toolchain and all ordinary words in a business
+ * file share, so none of them is on this list. Excluding a directory hides it
+ * silently, and hiding a folder of real data is a worse failure than listing a
+ * folder of build output. Where a root is known to be a checkout, name those
+ * directories with `--exclude`.
+ */
+const DEFAULT_EXCLUDED_DIRECTORIES = [
+  '.bundle',
+  '.cargo',
+  '.elixir_ls',
+  '.git',
+  '.gradle',
+  '.hg',
+  '.mypy_cache',
+  '.next',
+  '.nuxt',
+  '.parcel-cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.svn',
+  '.terraform',
+  '.tox',
+  '.turbo',
+  '.venv',
+  '__pycache__',
+  '_build',
+  'bower_components',
+  'deps',
+  'node_modules',
+] as const
+
+/**
+ * Filenames that are credentials far more often than they are content.
+ *
+ * `*.key` is deliberately absent: it is the Apple Keynote extension as well as
+ * a private-key one, and a file share that silently hides every presentation
+ * is worse than one that serves a key file the include rules already allowed.
+ */
+const DEFAULT_EXCLUDED_FILES = [
+  '.env',
+  '.env.*',
+  '*.p12',
+  '*.pem',
+  '*.pfx',
+  'id_dsa',
+  'id_ecdsa',
+  'id_ed25519',
+  'id_rsa',
+] as const
+
+/**
+ * The excludes a root applies unless the host opts out.
+ *
+ * Every entry is an ordinary `--exclude` glob, so this list can only narrow
+ * what `--include` selected -- the same one-way rule the flag already obeys.
+ * Each directory contributes two patterns: the directory itself, so a walk
+ * skips it without descending, and its contents, so naming a path inside one
+ * directly is refused too.
+ */
+export const DEFAULT_EXCLUDE: readonly string[] = [
+  ...DEFAULT_EXCLUDED_DIRECTORIES.flatMap((name) => [`**/${name}`, `**/${name}/**`]),
+  ...DEFAULT_EXCLUDED_FILES.map((glob) => `**/${glob}`),
+]
+
 /** Decides which relative paths a root serves. The default is no files. */
 export interface Selector {
   /** True when the path is inside at least one include and no exclude. */
   readonly selects: (path: string) => boolean
   /** True when the path is excluded, so a directory walk may skip it whole. */
   readonly excludes: (path: string) => boolean
+  /**
+   * True when the path or any directory above it is excluded.
+   *
+   * The walk gets this for free by pruning as it descends, so `excludes` above
+   * stays a single cheap test on the path it was handed. A tool that opens a
+   * path directly skips that descent, and `--exclude secret` plainly means the
+   * files under it too, so those call sites check the whole chain instead.
+   */
+  readonly excludesAncestor: (path: string) => boolean
   /**
    * True when some include pattern can reach the root's own top level.
    *
@@ -96,15 +182,41 @@ export interface Selector {
   readonly servesRootLevel: boolean
 }
 
-export function createSelector(include: readonly string[], exclude: readonly string[]): Selector {
-  const included = include.map(compileGlob)
-  const excluded = exclude.map(compileGlob)
+/**
+ * Builds a selector from includes and two exclude sets.
+ *
+ * `caselessExclude` is matched without regard to case. That is for the
+ * built-in list: on a case-insensitive filesystem -- macOS and Windows by
+ * default -- `NODE_MODULES/pkg.js` and `.ENV` name the very same bytes as the
+ * excluded spelling, so a case-sensitive pattern is an alias away from being
+ * bypassed. Operator `--exclude` globs stay case-sensitive, because there a
+ * caller means the exact pattern they wrote.
+ */
+export function createSelector(
+  include: readonly string[],
+  exclude: readonly string[],
+  caselessExclude: readonly string[] = [],
+): Selector {
+  const included = include.map((pattern) => compileGlob(pattern))
+  const excluded = [
+    ...exclude.map((pattern) => compileGlob(pattern)),
+    ...caselessExclude.map((pattern) => compileGlob(pattern, 'i')),
+  ]
   const matches = (patterns: readonly RegExp[], path: string): boolean =>
     patterns.some((pattern) => pattern.test(path))
+
+  const excludesAncestor = (path: string): boolean => {
+    for (let cursor = path; cursor !== ''; cursor = cursor.slice(0, Math.max(cursor.lastIndexOf('/'), 0))) {
+      if (matches(excluded, cursor)) return true
+      if (!cursor.includes('/')) break
+    }
+    return false
+  }
 
   return {
     selects: (path) => matches(included, path) && !matches(excluded, path),
     excludes: (path) => matches(excluded, path),
+    excludesAncestor,
     servesRootLevel: include.some(matchesRootLevel),
   }
 }

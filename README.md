@@ -19,18 +19,19 @@ npx -y ptc-fs-mcp --root ./workspace --include '**'
 
 ## Tools
 
-| Tool              | Effect | Returns                                                |
-| ----------------- | ------ | ------------------------------------------------------ |
-| `list_directory`  | read   | Sorted, paginated entries under a relative prefix      |
-| `search_files`    | read   | Sorted, paginated paths containing a literal substring |
-| `search_text`     | read   | Paginated literal matches with path and line evidence  |
-| `read_text_file`  | read   | Paginated exact UTF-8 byte chunks                      |
-| `write_text_file` | write  | Replaces one regular file, reports path and bytes      |
+| Tool              | Effect | Returns                                                 |
+| ----------------- | ------ | ------------------------------------------------------- |
+| `list_directory`  | read   | Sorted, paginated entries under a relative prefix       |
+| `search_files`    | read   | Sorted, paginated paths containing a literal substring  |
+| `search_text`     | read   | Paginated literal matches with path and line evidence   |
+| `read_text_file`  | read   | Paginated exact UTF-8 byte chunks, from a line if asked |
+| `write_text_file` | write  | Replaces one regular file, reports path and bytes       |
 
 The four read tools accept optional `cursor` and `limit` and return exactly
 `items`, `next_cursor`, and `content_hash`. Start without a cursor and follow
 `next_cursor` until it is null. For `read_text_file`, concatenating item `text`
-reconstructs the file exactly.
+reconstructs the file exactly -- or, when `start_line` was given, exactly the
+part of it from that line on.
 
 ## Live bytes
 
@@ -99,17 +100,23 @@ only cover a bounded capture, and this server does not take one.
 ptc-fs-mcp --root ./workspace --include 'lib/**' --include 'docs/**' --exclude '**/secrets/**'
 ```
 
-| Option                        | Meaning                                                            |
-| ----------------------------- | ------------------------------------------------------------------ |
-| `--root <dir>`                | Directory to confine to. Required.                                 |
-| `--include <glob>`            | Serve matching paths. Required, repeatable.                        |
-| `--exclude <glob>`            | Never serve matching paths. Repeatable; may only narrow.           |
-| `--max-file-bytes <n>`        | Do not serve files larger than this.                               |
-| `--max-read-bytes <n>`        | Source bytes considered per read page. Default 16384.              |
-| `--max-result-bytes <n>`      | Complete decoded tool result ceiling. Default 48000.               |
-| `--max-write-bytes <n>`       | Largest `write_text_file` payload. Default 65536.                  |
-| `--cursor-key-env <name>`     | Read a stable base64url cursor key from this environment variable. |
-| `--max-cursor-hash-bytes <n>` | File bytes hashed per deterministic call. Default 16777216.        |
+| Option                        | Meaning                                                                      |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `--root <dir>`                | Directory to confine to. Required.                                           |
+| `--include <glob>`            | Serve matching paths. Required, repeatable.                                  |
+| `--exclude <glob>`            | Never serve matching paths. Repeatable; may only narrow.                     |
+| `--no-default-exclude`        | Drop the built-in excludes described below.                                  |
+| `--max-files <n>`             | Most files one traversal may select. Default 50000.                          |
+| `--max-directories <n>`       | Most directories one traversal may enter. Default 50000.                     |
+| `--max-depth <n>`             | Deepest directory nesting to walk. Default 64.                               |
+| `--max-entries <n>`           | Most directory entries one traversal may read. Default 1000000.              |
+| `--max-scan-bytes <n>`        | Source bytes scanned per `search_text` page. Default 4194304, minimum 16384. |
+| `--max-file-bytes <n>`        | Do not serve files larger than this.                                         |
+| `--max-read-bytes <n>`        | Source bytes considered per read page. Default 16384.                        |
+| `--max-result-bytes <n>`      | Complete decoded tool result ceiling. Default 48000.                         |
+| `--max-write-bytes <n>`       | Largest `write_text_file` payload. Default 65536.                            |
+| `--cursor-key-env <name>`     | Read a stable base64url cursor key from this environment variable.           |
+| `--max-cursor-hash-bytes <n>` | File bytes hashed per deterministic call. Default 16777216.                  |
 
 The cursor key must be canonical unpadded base64url encoding of at least 32
 bytes (256 bits). If the named variable is missing, empty, malformed, or too
@@ -180,6 +187,159 @@ Install it from a host document by pinning a version:
   "inherit_environment": true
 }
 ```
+
+### What is excluded before you ask
+
+`--include` decides what a root can serve; a built-in exclude list then removes
+what a caller almost never means to read. It covers dependency and tool output
+-- `node_modules`, `_build`, `deps`, `__pycache__`, `bower_components`, `.git`,
+`.hg`, `.svn`, `.venv`, `.tox`, `.next`, `.nuxt`, `.gradle`, `.terraform`,
+`.turbo`, `.cargo`, `.bundle`, `.elixir_ls`, `.mypy_cache`, `.pytest_cache`,
+`.parcel-cache`, `.ruff_cache` -- and filenames that are credentials more often
+than content: `.env`, `.env.*`, `*.pem`, `*.p12`, `*.pfx`, and the usual SSH
+private keys.
+
+Every name on that list is one nobody picks for their own data, and that rule
+is doing real work. `build`, `dist`, `target`, `coverage`, and `cover` are all
+build output in some toolchain and all ordinary words in a business file share,
+so none of them is excluded. Neither is `*.key`, which is the Apple Keynote
+extension as well as a private-key one. Excluding a directory hides it
+silently, and silently hiding real data is a worse failure than listing a
+directory of build output. Where a root is known to be a checkout, name those
+directories with `--exclude`.
+
+Every entry is an ordinary exclude glob, so the list can only narrow what
+`--include` selected, and an excluded directory is skipped without descending
+into it. The built-in patterns are matched without regard to case, because on
+a case-insensitive filesystem `NODE_MODULES/pkg.js` names the very same bytes
+as the excluded spelling and a case-sensitive pattern would be one alias away
+from being bypassed. An explicit `--exclude` stays case-sensitive: there a
+caller means the exact pattern they wrote. That is a cost question as much as a tidiness one: a scan budget spent
+walking `deps` is a page of empty results while the match a caller wanted waits
+behind it.
+
+`--no-default-exclude` drops the whole list at once. There is no per-pattern
+re-inclusion, because ordering-sensitive negation is the part of ignore files
+that reliably surprises the person writing them. Nothing here reads
+`.gitignore`: what a root serves is decided by the configuration that started
+the server, not by a file inside the tree it is serving.
+
+Because excludes win over includes, a default can defeat an include written on
+purpose. When a literal `--include` -- one with no wildcards -- is covered by a
+built-in exclude, startup says so on stderr and names the flag that turns the
+list off.
+
+### Searching for more than one thing
+
+`search_files` and `search_text` take either a `query` or an `any_of` list of
+up to 16 substrings, and match a path or a line that contains any one of them.
+A line matching several terms is still reported once.
+
+`case_insensitive` folds ASCII letters on both sides of the comparison. The
+fold is deliberately ASCII-only: the scanner is byte-oriented, and full Unicode
+case folding is neither byte-local nor length-preserving, so `CAFÉ` matches
+`CAFÉ` and not `café`.
+
+Terms are literal. `any_of` is a list rather than a `|` inside `query` for that
+reason -- splitting on a bare pipe would quietly change the meaning of every
+search for text that contains one, and `string | number` is ordinary source.
+A cursor is bound to the exact terms and folding it was issued for.
+
+`search_text` skips a file whole when one line in its opening bytes both
+contains a NUL and fails to decode as UTF-8. Each part of that is load-bearing.
+Either signal alone discards real text -- NUL is itself valid UTF-8, and a text
+file holding one malformed line is meant to lose that line rather than the
+file -- and the two must fall on the same line, or a text file with a NUL in
+one place and a bad byte in another would be condemned by the combination.
+What is left identifies the compiled artifacts and dumps whose every line would
+be dropped anyway: on one real checkout, 146 MB of the 374 MB served. Listings stay content-blind,
+and `read_text_file` still refuses the same file with `file is not valid
+UTF-8`.
+
+That decision is still made from the opening 8 KiB, so it can be wrong in one
+direction worth naming: a file whose first lines look binary but which holds
+real text further in is skipped whole, and its matches are not reported. Every tool
+that classifies files this way shares the limitation; the trade is against
+spending a page budget proving a compiled artifact holds nothing, which on one
+real checkout was half the bytes served. Where a root holds such files and
+their text matters, extract it before serving the root.
+
+### Serving a large root
+
+Every page re-walks the root to bind its cursor, because reads reflect the
+filesystem at call time and nothing is cached between calls. On a large tree
+that walk, not the scan, is what a search costs, so the number of round trips
+matters more than the work inside one.
+
+Two dials follow from that. `--max-scan-bytes` sets how much source text one
+`search_text` page may scan; raising it trades a longer call for far fewer of
+them, and the result ceiling still bounds what comes back. The walk ceilings --
+`--max-files`, `--max-directories`, `--max-depth`, `--max-entries` -- bound the
+traversal itself and fail the call with an actionable error rather than
+scanning without limit.
+
+Scoping `--include` is worth more than either. A 13,000-file checkout served
+with `--include '**'` is 374 MB, half of it compiled artifacts; the same root
+served as `--include 'lib/**' --include 'test/**'` answers the same search in
+four pages.
+
+`list_directory` does not pay for the whole tree. A directory is listed exactly
+when it holds at least one served file at any depth, and each probe stops at
+the first one it finds, so listing one level costs a probe per child rather
+than an inventory of everything beneath it.
+
+### Reading part of a large file
+
+`read_text_file` pages from the start of a file by default. `start_line` begins
+at a 1-based line instead, which is what makes a large CSV or log navigable: a
+slice at row 4,000 costs one page rather than the 3,999 rows before it crossing
+the result budget first. `byte_offset` stays absolute, so a line-addressed read
+is still citable against the whole file, and a cursor is bound to the
+`start_line` it was issued for.
+
+Only the bytes actually returned have to decode. Seeking to a line counts
+newlines and reads nothing out, so a file whose earlier lines are not valid
+UTF-8 can still be read from a later one -- which is the useful answer for a
+CSV whose header was written in some other encoding. Reading that same file
+from the beginning still fails, because then those bytes would be served.
+
+There is no line index to seek with, so locating a line counts newlines from
+the start. That happens only on the page with no cursor to resume from -- every
+later page reads its offset out of the cursor -- and it is charged against
+`--max-scan-bytes`, so an absurd line number fails with an actionable error
+rather than reading without limit.
+
+Nothing above understands CSV. Deliberately: quoting, embedded newlines,
+delimiters, and headers are shaping decisions that belong wherever the rows are
+consumed, and a second parser here would only disagree with that one in corner
+cases. This server narrows bytes; the consumer gives them meaning. Reading the
+header is one call and the rows another, which is all a parser needs.
+
+### Text that is not UTF-8
+
+This is a UTF-8 text server, and two consequences are worth stating rather than
+discovering.
+
+`read_text_file` refuses a file that is not valid UTF-8, which includes a CSV
+exported as cp1252 or latin-1 -- still a common shape for spreadsheet output.
+`search_text` skips a line it cannot decode, so a search over a mixed-encoding
+tree reports matches only from the files that decode, and says nothing about
+the ones that did not. That silence is the sharp edge: transcode at the source
+if a root holds legacy encodings. Serving them here would mean `content_hash`
+naming bytes that were never on disk, which is the one thing a citation may not
+do.
+
+A UTF-8 byte-order mark is content, not metadata, here. `read_text_file`
+returns the bytes exactly as they are, so a BOM arrives as a leading `\uFEFF`
+and a naive parse carries it into the first column name. Stripping it is one
+expression in the consumer:
+
+```clojure
+(if (starts-with? raw "\uFEFF") (subs raw 1) raw)
+```
+
+The server does not, because concatenated pages must reconstruct the file
+exactly and `content_hash` names the bytes actually served.
 
 ### Spawning without an inherited environment
 
@@ -273,10 +433,15 @@ Tasks.
 ## Confinement
 
 - Relative paths only. Absolute paths, `.`/`..` segments, NUL bytes, and Windows
-  separators are rejected rather than resolved.
+  separators are rejected rather than resolved. The one exception is a bare `.`,
+  which names the root exactly as the empty string does; `./lib` and `lib/.`
+  still carry a dot segment and are still rejected.
 - Symbolic links are skipped, never followed, so a link inside the root cannot
   reach bytes outside it. The final `open` uses `O_NOFOLLOW`, so a link swapped
-  in after the check still fails.
+  in after the check still fails. `O_NOFOLLOW` covers only the name it opens,
+  so every ancestor of a path is checked before that open too: naming
+  `link/secret.txt`, or listing `link` as a prefix, is refused rather than
+  followed.
 - A directory appears in a listing only because it holds something served, so
   an unserved directory's name never leaks.
 - `write_text_file` accepts one lowercase basename — no directories, no

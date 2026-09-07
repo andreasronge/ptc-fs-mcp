@@ -7,11 +7,22 @@
  * `open` uses `O_NOFOLLOW` so a link swapped in after the check still fails.
  */
 
-import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, opendirSync, openSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  opendirSync,
+  openSync,
+  writeSync,
+  type BigIntStats,
+  type Stats,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { ConfigError, ToolError } from './errors.js'
-import { createSelector, normalizeRelative, posixJoin, type Selector } from './paths.js'
+import { createSelector, DEFAULT_EXCLUDE, normalizeRelative, posixJoin, type Selector } from './paths.js'
 
 /** Bounds on what a single traversal may visit. Exceeding one fails the call. */
 export interface Limits {
@@ -23,22 +34,41 @@ export interface Limits {
   readonly maxFileBytes: number
   /** Source-file bytes considered for one `read_text_file` page. */
   readonly maxReadBytes: number
+  /**
+   * Source-file bytes `search_text` may scan for one page.
+   *
+   * This is a round-trip dial, not a safety one. Every page re-walks the root
+   * to bind its cursor, so on a large tree the walk, not the scan, dominates;
+   * raising this trades a longer single call for far fewer of them.
+   */
+  readonly maxScanBytes: number
   /** Complete decoded MCP result bytes allowed for any tool call. */
   readonly maxResultBytes: number
   /** The largest `write_text_file` payload, in UTF-8 bytes. */
   readonly maxWriteBytes: number
 }
 
+/**
+ * Opening bytes `search_text` samples to classify a file as binary.
+ *
+ * It is fixed rather than budget-relative so a file is classified the same way
+ * however the pages fell. The scanner re-reads these bytes afterwards and both
+ * reads are charged, so the budget stays a truthful bound on physical I/O --
+ * which is why `maxScanBytes` may not be set below twice this: a budget that
+ * one sniff could exhaust would leave a page unable to make progress.
+ */
+export const BINARY_SNIFF_BYTES = 8_192
 export const MAX_CONFIGURED_READ_BYTES = 1_048_576
 export const MAX_CONFIGURED_RESULT_BYTES = 1_048_576
 
 export const DEFAULT_LIMITS: Limits = {
-  maxFiles: 4_096,
-  maxDepth: 32,
-  maxDirectories: 8_192,
-  maxEntries: 100_000,
+  maxFiles: 50_000,
+  maxDepth: 64,
+  maxDirectories: 50_000,
+  maxEntries: 1_000_000,
   maxFileBytes: Number.MAX_SAFE_INTEGER,
   maxReadBytes: 16_384,
+  maxScanBytes: 4_194_304,
   maxResultBytes: 48_000,
   maxWriteBytes: 65_536,
 }
@@ -50,6 +80,15 @@ export interface RootOptions {
   readonly include: readonly string[]
   /** Globs that may only narrow what the includes selected. */
   readonly exclude?: readonly string[]
+  /**
+   * Whether to apply `DEFAULT_EXCLUDE` on top of `exclude`. Defaults to true.
+   *
+   * Opting out restores the pre-default behavior for every entry at once,
+   * dependency directories and credential filenames alike; there is no
+   * per-pattern re-inclusion, because ordering-sensitive negation is the part
+   * of ignore files that reliably surprises the person writing them.
+   */
+  readonly defaultExclude?: boolean
   readonly limits?: Partial<Limits>
 }
 
@@ -108,7 +147,189 @@ export function openRoot(options: RootOptions): Root {
   if (stat.isSymbolicLink()) throw new ConfigError('root must not be a symbolic link')
   if (!stat.isDirectory()) throw new ConfigError('root is not a directory')
 
-  return { absolute, selector: createSelector(options.include, options.exclude ?? []), limits }
+  const caseless = options.defaultExclude === false ? [] : DEFAULT_EXCLUDE
+  return { absolute, selector: createSelector(options.include, options.exclude ?? [], caseless), limits }
+}
+
+/**
+ * The absolute path of a relative directory `prefix`, or null when any
+ * component of it is missing, is not a directory, or is a symbolic link.
+ *
+ * `O_NOFOLLOW` protects only the component it opens, so an intermediate link
+ * -- `link/creds.txt` where `link` points outside the root -- is followed by
+ * the kernel before that flag ever applies. Every ancestor is therefore
+ * lstat-ed here before anything opens the result. This is the same guarantee
+ * the walk gets for free by descending one directory at a time, and it carries
+ * the same caveat the README already states: a privileged actor able to swap a
+ * parent directory between this check and the open is out of scope.
+ */
+/**
+ * `lstat`, or null for any reason it could not be taken.
+ *
+ * `throwIfNoEntry: false` suppresses only ENOENT; ENAMETOOLONG on an
+ * over-long component, or EACCES on an unreadable ancestor, still throw -- and
+ * the message Node builds carries the absolute host path, which no error
+ * leaving this server may contain. Every such failure means the same thing
+ * here anyway: the path is not one this root serves.
+ */
+function lstatOrNull(absolute: string, bigint: false): Stats | null
+function lstatOrNull(absolute: string, bigint: true): BigIntStats | null
+function lstatOrNull(absolute: string, bigint: boolean): Stats | BigIntStats | null {
+  try {
+    return bigint
+      ? (lstatSync(absolute, { throwIfNoEntry: false, bigint: true }) ?? null)
+      : (lstatSync(absolute, { throwIfNoEntry: false }) ?? null)
+  } catch {
+    return null
+  }
+}
+
+export function resolveDirectory(root: Root, prefix: string): string | null {
+  let absolute = root.absolute
+  if (prefix === '') return absolute
+  // Every caller normalizes first, but this function joins segments onto the
+  // root and opens the result, so it does not take that on trust.
+  if (normalizeRelative(prefix) !== prefix) return null
+  if (root.selector.excludesAncestor(prefix)) return null
+
+  for (const segment of prefix.split('/')) {
+    absolute = join(absolute, segment)
+    const stat = lstatOrNull(absolute, false)
+    if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return null
+  }
+  return absolute
+}
+
+/**
+ * The immediate children of `prefix` that this root serves, sorted by name.
+ *
+ * A directory is listed exactly when it holds at least one served file at any
+ * depth -- the same rule a full inventory produces, and the reason an unserved
+ * directory's name never leaks. But the answer needed per child is a boolean,
+ * not a file list, so each probe stops at the first served file it finds.
+ * Listing one level of a large tree therefore costs a probe per child instead
+ * of an inventory of everything beneath it.
+ */
+export function directoryListing(root: Root, prefix: string): Array<{ name: string; kind: string; path: string }> {
+  const counters = { directories: 0, entries: 0 }
+  const listed: Array<{ name: string; kind: string; path: string }> = []
+
+  // Depth is measured from the root, not from the listed directory, so naming
+  // a deep prefix cannot buy traversal the ceiling would otherwise refuse.
+  const depth = prefix === '' ? 0 : prefix.split('/').length
+  if (depth > root.limits.maxDepth) throw new ToolError('directory depth limit exceeded')
+
+  const directory = resolveDirectory(root, prefix)
+  if (directory === null) return []
+
+  // The requested directory and every ancestor resolved to reach it are
+  // charged, so a listing counts what an inventory of the same prefix would.
+  counters.directories = depth + 1
+  if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
+
+  let entries
+  try {
+    entries = opendirSync(directory)
+  } catch {
+    // No such directory, or not a directory at all. An empty listing is the
+    // same answer a full inventory gave, and it discloses nothing either way.
+    return []
+  }
+
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      counters.entries += 1
+      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
+
+      const path = posixJoin(prefix, entry.name)
+      if (normalizeRelative(path) !== path) continue
+      if (root.selector.excludes(path)) continue
+
+      const absolute = join(entries.path, entry.name)
+      const stat = lstatOrNull(absolute, true)
+      if (!stat || stat.isSymbolicLink()) continue
+
+      if (stat.isDirectory()) {
+        if (servesAnything(root, absolute, path, depth + 1, counters)) {
+          if (listed.length >= root.limits.maxFiles) throw new ToolError('file limit exceeded')
+          listed.push({ name: entry.name, kind: 'directory', path })
+        }
+        continue
+      }
+
+      if (!stat.isFile() || !root.selector.selects(path)) continue
+      if (Number(stat.size) > root.limits.maxFileBytes) continue
+      // The ceiling no longer covers the whole tree -- that was the point --
+      // but it still bounds what one listing may materialize.
+      if (listed.length >= root.limits.maxFiles) throw new ToolError('file limit exceeded')
+      listed.push({ name: entry.name, kind: 'file', path })
+    }
+  } finally {
+    entries.closeSync()
+  }
+
+  return listed.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+}
+
+/** True as soon as one served file is found anywhere beneath `directory`. */
+function servesAnything(
+  root: Root,
+  directory: string,
+  prefix: string,
+  depth: number,
+  counters: { directories: number; entries: number },
+): boolean {
+  if (depth > root.limits.maxDepth) throw new ToolError('directory depth limit exceeded')
+  counters.directories += 1
+  if (counters.directories > root.limits.maxDirectories) throw new ToolError('directory limit exceeded')
+
+  let entries
+  try {
+    entries = opendirSync(directory)
+  } catch {
+    return false
+  }
+
+  // Names are collected so the probe can run in a defined order: it stops at
+  // the first served file, and in readdir order -- which no filesystem
+  // promises -- which subdirectories it descended into first would decide how
+  // much of the shared budget it spent. Each entry is charged as it is read,
+  // not as it is probed, so collecting them is bounded by the same ceiling
+  // that bounds walking them.
+  const names: string[] = []
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      counters.entries += 1
+      if (counters.entries > root.limits.maxEntries) throw new ToolError('directory entry limit exceeded')
+      names.push(entry.name)
+    }
+  } finally {
+    entries.closeSync()
+  }
+  names.sort()
+
+  {
+    for (const name of names) {
+      const path = posixJoin(prefix, name)
+      if (normalizeRelative(path) !== path) continue
+      if (root.selector.excludes(path)) continue
+
+      const absolute = join(directory, name)
+      const stat = lstatOrNull(absolute, true)
+      if (!stat || stat.isSymbolicLink()) continue
+
+      if (stat.isDirectory()) {
+        if (servesAnything(root, absolute, path, depth + 1, counters)) return true
+        continue
+      }
+
+      if (!stat.isFile() || !root.selector.selects(path)) continue
+      if (Number(stat.size) > root.limits.maxFileBytes) continue
+      return true
+    }
+  }
+
+  return false
 }
 
 /**
@@ -158,7 +379,7 @@ function walk(
       if (root.selector.excludes(path)) continue
 
       const absolute = join(directory, entry.name)
-      const stat = lstatSync(absolute, { throwIfNoEntry: false, bigint: true })
+      const stat = lstatOrNull(absolute, true)
       if (!stat || stat.isSymbolicLink()) continue
 
       if (stat.isDirectory()) {
@@ -192,6 +413,17 @@ function identityOf(stat: { size: bigint; mtimeNs: bigint; ctimeNs: bigint; ino:
  * the final component even if it appeared after the walk observed the path.
  */
 export function openFileForRead(root: Root, path: string): OpenFile {
+  // The parent chain is checked before the descriptor is opened, for the same
+  // reason resolveDirectory exists: O_NOFOLLOW below guards the final name
+  // only, so a symlinked ancestor would otherwise be followed by the kernel.
+  // The exclude test comes first so the refusal names the rule that actually
+  // refused, rather than the generic message resolveDirectory would give for
+  // the same path.
+  if (root.selector.excludesAncestor(path)) throw new ToolError('path matches an --exclude pattern of this root')
+  const separator = path.lastIndexOf('/')
+  if (separator !== -1 && resolveDirectory(root, path.slice(0, separator)) === null) {
+    throw new ToolError('path is not served by this root')
+  }
   if (!root.selector.selects(path)) throw new ToolError('path is not served by this root')
 
   let descriptor: number
@@ -276,6 +508,7 @@ function validateLimits(limits: Limits): void {
     limits.maxEntries,
     limits.maxFileBytes,
     limits.maxReadBytes,
+    limits.maxScanBytes,
     limits.maxResultBytes,
     limits.maxWriteBytes,
   ]
@@ -284,6 +517,7 @@ function validateLimits(limits: Limits): void {
     !Number.isSafeInteger(limits.maxDepth) ||
     limits.maxDepth < 0 ||
     limits.maxReadBytes < 4 ||
+    limits.maxScanBytes < 2 * BINARY_SNIFF_BYTES ||
     limits.maxReadBytes > MAX_CONFIGURED_READ_BYTES ||
     limits.maxResultBytes < DEFAULT_LIMITS.maxResultBytes ||
     limits.maxResultBytes > MAX_CONFIGURED_RESULT_BYTES
