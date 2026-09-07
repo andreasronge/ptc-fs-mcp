@@ -183,7 +183,7 @@ Install it from a host document by pinning a version:
 "transport": {
   "type": "stdio",
   "command": "npx",
-  "args": ["-y", "ptc-fs-mcp@0.3.0", "--root", "workspace", "--include", "**"],
+  "args": ["-y", "ptc-fs-mcp@0.4.0", "--root", "workspace", "--include", "**"],
   "inherit_environment": true
 }
 ```
@@ -357,7 +357,7 @@ the package ahead of time and name the interpreter and the script absolutely,
 bypassing both `npx` and the shebang:
 
 ```console
-npm install ptc-fs-mcp@0.3.0
+npm install ptc-fs-mcp@0.4.0
 node -p process.execPath
 node -p "require.resolve('ptc-fs-mcp/package.json').replace(/package\.json$/, 'dist/cli.js')"
 ```
